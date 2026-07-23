@@ -127,6 +127,11 @@ function createHarness(savedSettings = {}) {
 }
 
 function waitForCaptionSettle() {
+  // Includes the 80 ms DOM settle and the 320 ms speech coalescing window.
+  return new Promise((resolve) => setTimeout(resolve, 430));
+}
+
+function waitForCaptionProcessing() {
   return new Promise((resolve) => setTimeout(resolve, 110));
 }
 
@@ -236,9 +241,7 @@ test("dòng hai chuyển lên dòng một không bị đọc lại khi node DOM 
 
   assert.equal(harness.spoken.length, 2);
   harness.endSpeech(1);
-  assert.equal(harness.spoken[2].text, "Nội dung mới");
-  harness.endSpeech(2);
-  assert.equal(harness.spoken[3].text, "tiếp tục");
+  assert.equal(harness.spoken[2].text, "Nội dung mới tiếp tục");
   assert.equal(
     harness.spoken.filter((utterance) => utterance.text === "Dòng hai đang đọc").length,
     1
@@ -270,12 +273,10 @@ test("phần đã xếp hàng của dòng hai vẫn được nhớ sau khi dòng
 
   assert.equal(harness.spoken.length, 2);
   harness.endSpeech(1);
-  assert.equal(harness.spoken[2].text, "ba");
-  harness.endSpeech(2);
-  assert.equal(harness.spoken[3].text, "bốn");
+  assert.equal(harness.spoken[2].text, "ba bốn");
   assert.deepEqual(
     harness.spoken.map((utterance) => utterance.text),
-    ["một", "hai", "ba", "bốn"]
+    ["một", "hai", "ba bốn"]
   );
 });
 
@@ -287,21 +288,19 @@ test("dòng cuộn bằng node mới vẫn nối đúng phần còn lại của 
   await waitForCaptionSettle();
   harness.setCaption("một", "hel");
   harness.mutate();
-  await waitForCaptionSettle();
-  harness.endSpeech(0);
-
-  assert.equal(harness.spoken[1].text, "hel");
+  await waitForCaptionProcessing();
+  assert.equal(harness.spoken.length, 1);
 
   harness.replaceCaption("hello");
   harness.mutate();
   await waitForCaptionSettle();
 
-  assert.equal(harness.spoken.length, 2);
-  harness.endSpeech(1);
-  assert.equal(harness.spoken[2].text, "lo");
+  assert.equal(harness.spoken.length, 1);
+  harness.endSpeech(0);
+  assert.equal(harness.spoken[1].text, "hello");
   assert.deepEqual(
     harness.spoken.map((utterance) => utterance.text),
-    ["một", "hel", "lo"]
+    ["một", "hello"]
   );
 });
 
@@ -328,13 +327,93 @@ test("dòng dưới tạm biến mất vẫn giữ mốc chữ đã xếp hàng 
 
   assert.equal(harness.spoken.length, 2);
   harness.endSpeech(1);
-  assert.equal(harness.spoken[2].text, "C");
-  harness.endSpeech(2);
-  assert.equal(harness.spoken[3].text, "thêm");
+  assert.equal(harness.spoken[2].text, "C thêm");
   assert.deepEqual(
     harness.spoken.map((utterance) => utterance.text),
-    ["A", "B", "C", "thêm"]
+    ["A", "B", "C thêm"]
   );
+});
+
+test("các delta gần nhau được ghép thành một cụm đọc liền mạch", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("chúng");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.setCaption("chúng ta");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  harness.setCaption("chúng ta nghe rõ");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "chúng ta nghe rõ");
+});
+
+test("hậu tố của cùng một từ được ghép liền trước khi phát âm", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("hel");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.setCaption("hello");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "hello");
+});
+
+test("dấu câu nối vào từ trước không trở thành utterance rời", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("hello");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  harness.setCaption("hello!");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "hello!");
+});
+
+test("luồng caption liên tục vẫn được phát trong giới hạn chờ tối đa", async () => {
+  const harness = createHarness();
+  let caption = "một";
+
+  harness.setCaption(caption);
+  harness.mutate();
+
+  for (let index = 1; index <= 10; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    caption += ` ${index}`;
+    harness.setCaption(caption);
+    harness.mutate();
+  }
+
+  assert.equal(harness.spoken.length, 1);
+  assert.match(harness.spoken[0].text, /^một 1 2/);
+});
+
+test("tắt extension khi cụm chữ còn trong bộ đệm thì không phát muộn", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("chưa được phát");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.changeSettings({ enabled: false });
+  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  assert.equal(harness.cancelCount, 1);
+  assert.equal(harness.spoken.length, 0);
 });
 
 test("node caption mới giữ nguyên câu sau dù nó lặp hai từ ở ranh giới", async () => {
@@ -406,6 +485,7 @@ test("caption tăng liên tục vẫn được đẩy vào FIFO trước khi mut
     harness.mutate();
   }
 
+  await waitForCaptionSettle();
   assert.equal(harness.spoken.length, 1);
   assert.match(harness.spoken[0].text, /^zero 1 2 3 4 5/);
 });

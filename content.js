@@ -13,6 +13,8 @@
   };
   const CAPTION_SETTLE_MS = 80;
   const CAPTION_MAX_WAIT_MS = 250;
+  const SPEECH_BATCH_SETTLE_MS = 320;
+  const SPEECH_BATCH_MAX_WAIT_MS = 900;
 
   let settings = { ...DEFAULTS };
   let displayedCaption = { text: "", nodes: [], lines: [] };
@@ -23,11 +25,24 @@
   const speechQueue = [];
   let activeUtterance = null;
   let speechGeneration = 0;
+  let pendingSpeechText = "";
+  let pendingSpeechAttachesToPrevious = false;
+  let pendingSpeechStartsNewEntry = false;
+  let speechBatchTimer = null;
+  let speechBatchDeadlineTimer = null;
   let rollUpLineage = null;
   let observer = null;
 
   function normalize(text) {
     return text.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  function appendSpeechText(base, addition, attachToPrevious = false) {
+    if (!base) return normalize(addition);
+    if (!addition) return normalize(base);
+    return normalize(
+      attachToPrevious ? `${base}${addition}` : `${base} ${addition}`
+    );
   }
 
   function currentCaption() {
@@ -120,7 +135,9 @@
       // callback so it cannot consume an item from the new queue.
       if (generation !== speechGeneration || activeUtterance !== utterance) return;
       activeUtterance = null;
-      pumpSpeechQueue();
+      // If a fragment is still inside the coalescing window, let its timer merge
+      // it into the queued phrase before starting the next utterance.
+      if (!pendingSpeechText) pumpSpeechQueue();
     };
 
     utterance.onend = finish;
@@ -133,15 +150,78 @@
     }
   }
 
-  function enqueueSpeech(text) {
-    const addition = normalize(text);
-    if (!settings.enabled || !addition) return;
+  function flushSpeechBuffer() {
+    if (speechBatchTimer) clearTimeout(speechBatchTimer);
+    speechBatchTimer = null;
+    if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
+    speechBatchDeadlineTimer = null;
 
-    speechQueue.push(addition);
+    if (!pendingSpeechText) return;
+
+    if (speechQueue.length && !pendingSpeechStartsNewEntry) {
+      const lastIndex = speechQueue.length - 1;
+      speechQueue[lastIndex] = appendSpeechText(
+        speechQueue[lastIndex],
+        pendingSpeechText,
+        pendingSpeechAttachesToPrevious
+      );
+    } else {
+      speechQueue.push(pendingSpeechText);
+    }
+
+    pendingSpeechText = "";
+    pendingSpeechAttachesToPrevious = false;
+    pendingSpeechStartsNewEntry = false;
     pumpSpeechQueue();
   }
 
+  function scheduleSpeechBufferFlush() {
+    if (speechBatchTimer) clearTimeout(speechBatchTimer);
+    speechBatchTimer = setTimeout(flushSpeechBuffer, SPEECH_BATCH_SETTLE_MS);
+
+    // Continuous captions still need bounded latency, but the larger deadline
+    // lets several nearby words become one intelligible utterance.
+    if (!speechBatchDeadlineTimer) {
+      speechBatchDeadlineTimer = setTimeout(
+        flushSpeechBuffer,
+        SPEECH_BATCH_MAX_WAIT_MS
+      );
+    }
+  }
+
+  function enqueueSpeech(
+    text,
+    attachToPrevious = false,
+    startsNewEntry = false
+  ) {
+    const addition = normalize(text);
+    if (!settings.enabled || !addition) return;
+
+    if (startsNewEntry && pendingSpeechText) flushSpeechBuffer();
+
+    if (!pendingSpeechText) {
+      pendingSpeechText = addition;
+      pendingSpeechAttachesToPrevious = attachToPrevious;
+      pendingSpeechStartsNewEntry = startsNewEntry;
+    } else {
+      pendingSpeechText = appendSpeechText(
+        pendingSpeechText,
+        addition,
+        attachToPrevious
+      );
+    }
+
+    scheduleSpeechBufferFlush();
+  }
+
   function clearSpeechQueue() {
+    if (speechBatchTimer) clearTimeout(speechBatchTimer);
+    speechBatchTimer = null;
+    if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
+    speechBatchDeadlineTimer = null;
+    pendingSpeechText = "";
+    pendingSpeechAttachesToPrevious = false;
+    pendingSpeechStartsNewEntry = false;
     speechQueue.length = 0;
     speechGeneration += 1;
     activeUtterance = null;
@@ -150,17 +230,19 @@
 
   function compareCommittedLine(committedText, currentText) {
     if (currentText === committedText) {
-      return { addition: "", committedText };
+      return { addition: "", attachToPrevious: false, committedText };
     }
     if (currentText.startsWith(committedText)) {
+      const rawAddition = currentText.slice(committedText.length);
       return {
-        addition: normalize(currentText.slice(committedText.length)),
+        addition: normalize(rawAddition),
+        attachToPrevious: rawAddition.length > 0 && !/^\s/.test(rawAddition),
         committedText: currentText
       };
     }
     if (committedText.startsWith(currentText)) {
       // A temporary shrink must not move the FIFO watermark backwards.
-      return { addition: "", committedText };
+      return { addition: "", attachToPrevious: false, committedText };
     }
     return null;
   }
@@ -186,8 +268,19 @@
 
     const baseLines = committedLines.slice(offset);
     const nextCommittedLines = [];
-    const additions = [];
+    let addition = "";
+    let attachToPrevious = false;
     let everyVisibleLineMatched = true;
+
+    const appendAddition = (text, attach = false) => {
+      if (!text) return;
+      if (!addition) {
+        addition = text;
+        attachToPrevious = attach;
+        return;
+      }
+      addition = appendSpeechText(addition, text, attach);
+    };
 
     for (let index = 0; index < currentLines.length; index += 1) {
       const currentText = currentLines[index];
@@ -198,13 +291,13 @@
 
       if (comparison) {
         nextCommittedLines.push(comparison.committedText);
-        if (comparison.addition) additions.push(comparison.addition);
+        appendAddition(comparison.addition, comparison.attachToPrevious);
       } else {
         // The anchored first line proves continuity; a different later line is
         // genuinely new and becomes a new committed FIFO record.
         everyVisibleLineMatched = false;
         nextCommittedLines.push(currentText);
-        additions.push(currentText);
+        appendAddition(currentText);
       }
     }
 
@@ -220,7 +313,8 @@
     }
 
     return {
-      addition: normalize(additions.join(" ")),
+      addition,
+      attachToPrevious,
       committedLines: nextCommittedLines
     };
   }
@@ -295,6 +389,19 @@
     return current;
   }
 
+  function captionAdditionAttachesToPrevious(
+    previousCaption,
+    currentCaptionSnapshot
+  ) {
+    if (!sharesCaptionNode(previousCaption, currentCaptionSnapshot)) return false;
+    if (!currentCaptionSnapshot.text.startsWith(previousCaption.text)) return false;
+
+    const rawAddition = currentCaptionSnapshot.text.slice(
+      previousCaption.text.length
+    );
+    return rawAddition.length > 0 && !/^\s/.test(rawAddition);
+  }
+
   function isTransientSameLineShrink(previousCaption, currentCaptionSnapshot) {
     if (
       previousCaption.lines.length !== currentCaptionSnapshot.lines.length ||
@@ -325,18 +432,28 @@
     if (lineageResult) {
       rollUpLineage = lineageResult.committedLines;
       displayedCaption = caption;
-      enqueueSpeech(lineageResult.addition);
+      enqueueSpeech(
+        lineageResult.addition,
+        lineageResult.attachToPrevious
+      );
       return;
     }
 
+    const startsNewEntry =
+      Boolean(displayedCaption.text) &&
+      !sharesCaptionNode(displayedCaption, caption);
     const addition = captionAddition(displayedCaption, caption);
+    const attachToPrevious = captionAdditionAttachesToPrevious(
+      displayedCaption,
+      caption
+    );
     // displayedCaption is also the committed FIFO watermark.  Do not move it
     // backwards when YouTube temporarily shortens the same visual line, or the
     // restored suffix would be queued and spoken a second time.
     if (!isTransientSameLineShrink(displayedCaption, caption)) {
       displayedCaption = caption;
     }
-    enqueueSpeech(addition);
+    enqueueSpeech(addition, attachToPrevious, startsNewEntry);
   }
 
   function flushScheduledCaption() {
@@ -393,6 +510,7 @@
     if (!caption.text) {
       // Do not lose a short caption that disappeared before the settle timer.
       flushScheduledCaption();
+      flushSpeechBuffer();
       // A later identical sentence is a new caption and must be read again.
       displayedCaption = { text: "", nodes: [], lines: [] };
       rollUpLineage = null;
