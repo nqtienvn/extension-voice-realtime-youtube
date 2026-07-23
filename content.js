@@ -15,14 +15,15 @@
   const CAPTION_MAX_WAIT_MS = 250;
 
   let settings = { ...DEFAULTS };
-  let displayedCaption = { text: "", nodes: [] };
-  let observedCaption = { text: "", nodes: [] };
+  let displayedCaption = { text: "", nodes: [], lines: [] };
+  let observedCaption = { text: "", nodes: [], lines: [] };
   let scheduledCaption = null;
   let captionTimer = null;
   let captionDeadlineTimer = null;
   const speechQueue = [];
   let activeUtterance = null;
   let speechGeneration = 0;
+  let rollUpLineage = null;
   let observer = null;
 
   function normalize(text) {
@@ -37,11 +38,41 @@
       ".ytp-caption-window-container .ytp-caption-segment"
     );
     const nodes = Array.from(segments);
-    if (!nodes.length) return { text: "", nodes };
+    if (!nodes.length) return { text: "", nodes, lines: [] };
+
+    const lineGroups = [];
+    const groupsByNode = new Map();
+
+    for (const segment of nodes) {
+      const closestLine =
+        typeof segment.closest === "function"
+          ? segment.closest(".caption-visual-line")
+          : null;
+      const lineNode = closestLine || segment.parentElement || segment;
+      let group = groupsByNode.get(lineNode);
+
+      if (!group) {
+        group = { node: lineNode, segments: [] };
+        groupsByNode.set(lineNode, group);
+        lineGroups.push(group);
+      }
+
+      group.segments.push(segment);
+    }
+
+    const lines = lineGroups
+      .map((group) => ({
+        node: group.node,
+        text: normalize(
+          group.segments.map((segment) => segment.textContent || "").join(" ")
+        )
+      }))
+      .filter((line) => line.text);
 
     return {
-      text: normalize(nodes.map((segment) => segment.textContent || "").join(" ")),
-      nodes
+      text: normalize(lines.map((line) => line.text).join(" ")),
+      nodes,
+      lines
     };
   }
 
@@ -117,6 +148,101 @@
     speechSynthesis.cancel();
   }
 
+  function compareCommittedLine(committedText, currentText) {
+    if (currentText === committedText) {
+      return { addition: "", committedText };
+    }
+    if (currentText.startsWith(committedText)) {
+      return {
+        addition: normalize(currentText.slice(committedText.length)),
+        committedText: currentText
+      };
+    }
+    if (committedText.startsWith(currentText)) {
+      // A temporary shrink must not move the FIFO watermark backwards.
+      return { addition: "", committedText };
+    }
+    return null;
+  }
+
+  function applyRollUpLineage(committedLines, currentCaptionSnapshot) {
+    if (!committedLines.length || !currentCaptionSnapshot.lines.length) return null;
+
+    const currentLines = currentCaptionSnapshot.lines.map((line) => line.text);
+    let offset = compareCommittedLine(committedLines[0], currentLines[0]) ? 0 : -1;
+
+    // A later committed line moving into the first visual position is another
+    // roll. Search from the end because YouTube normally moves the bottom line.
+    if (offset < 0) {
+      for (let index = committedLines.length - 1; index > 0; index -= 1) {
+        if (compareCommittedLine(committedLines[index], currentLines[0])) {
+          offset = index;
+          break;
+        }
+      }
+    }
+
+    if (offset < 0) return null;
+
+    const baseLines = committedLines.slice(offset);
+    const nextCommittedLines = [];
+    const additions = [];
+    let everyVisibleLineMatched = true;
+
+    for (let index = 0; index < currentLines.length; index += 1) {
+      const currentText = currentLines[index];
+      const comparison =
+        index < baseLines.length
+          ? compareCommittedLine(baseLines[index], currentText)
+          : null;
+
+      if (comparison) {
+        nextCommittedLines.push(comparison.committedText);
+        if (comparison.addition) additions.push(comparison.addition);
+      } else {
+        // The anchored first line proves continuity; a different later line is
+        // genuinely new and becomes a new committed FIFO record.
+        everyVisibleLineMatched = false;
+        nextCommittedLines.push(currentText);
+        additions.push(currentText);
+      }
+    }
+
+    // YouTube may hide the trailing visual line for a single render. Preserve
+    // its committed watermark so restoring "C thêm" after [B, C] -> [B] queues
+    // only "thêm". A real upward roll uses offset > 0 and does not retain it.
+    if (
+      offset === 0 &&
+      everyVisibleLineMatched &&
+      currentLines.length < baseLines.length
+    ) {
+      nextCommittedLines.push(...baseLines.slice(currentLines.length));
+    }
+
+    return {
+      addition: normalize(additions.join(" ")),
+      committedLines: nextCommittedLines
+    };
+  }
+
+  function startRollUpLineage(previousCaption, currentCaptionSnapshot) {
+    if (previousCaption.lines.length < 2 || !currentCaptionSnapshot.lines.length) {
+      return null;
+    }
+
+    const previousLines = previousCaption.lines.map((line) => line.text);
+    const currentFirstLine = currentCaptionSnapshot.lines[0].text;
+
+    // Only a later previous line can prove the initial two-line roll-up. This
+    // keeps unrelated one-line cues with similar text independent.
+    for (let index = previousLines.length - 1; index > 0; index -= 1) {
+      if (!compareCommittedLine(previousLines[index], currentFirstLine)) continue;
+      return applyRollUpLineage(previousLines.slice(index), currentCaptionSnapshot);
+    }
+
+    return null;
+  }
+
   function captionAddition(previousCaption, currentCaptionSnapshot) {
     const previous = previousCaption.text;
     const current = currentCaptionSnapshot.text;
@@ -169,9 +295,47 @@
     return current;
   }
 
+  function isTransientSameLineShrink(previousCaption, currentCaptionSnapshot) {
+    if (
+      previousCaption.lines.length !== currentCaptionSnapshot.lines.length ||
+      !sharesCaptionNode(previousCaption, currentCaptionSnapshot)
+    ) {
+      return false;
+    }
+
+    return previousCaption.lines.every((previousLine, index) => {
+      const currentLine = currentCaptionSnapshot.lines[index];
+      return (
+        previousLine.node === currentLine.node &&
+        previousLine.text.startsWith(currentLine.text)
+      );
+    });
+  }
+
   function processCaption(caption) {
+    let lineageResult = rollUpLineage
+      ? applyRollUpLineage(rollUpLineage, caption)
+      : null;
+
+    if (!lineageResult) {
+      rollUpLineage = null;
+      lineageResult = startRollUpLineage(displayedCaption, caption);
+    }
+
+    if (lineageResult) {
+      rollUpLineage = lineageResult.committedLines;
+      displayedCaption = caption;
+      enqueueSpeech(lineageResult.addition);
+      return;
+    }
+
     const addition = captionAddition(displayedCaption, caption);
-    displayedCaption = caption;
+    // displayedCaption is also the committed FIFO watermark.  Do not move it
+    // backwards when YouTube temporarily shortens the same visual line, or the
+    // restored suffix would be queued and spoken a second time.
+    if (!isTransientSameLineShrink(displayedCaption, caption)) {
+      displayedCaption = caption;
+    }
     enqueueSpeech(addition);
   }
 
@@ -230,7 +394,8 @@
       // Do not lose a short caption that disappeared before the settle timer.
       flushScheduledCaption();
       // A later identical sentence is a new caption and must be read again.
-      displayedCaption = { text: "", nodes: [] };
+      displayedCaption = { text: "", nodes: [], lines: [] };
+      rollUpLineage = null;
       return;
     }
 
@@ -296,9 +461,10 @@
       clearSpeechQueue();
     } else if (!wasEnabled) {
       // Enabling mid-caption should read the currently visible text once.
-      observedCaption = { text: "", nodes: [] };
-      displayedCaption = { text: "", nodes: [] };
+      observedCaption = { text: "", nodes: [], lines: [] };
+      displayedCaption = { text: "", nodes: [], lines: [] };
       scheduledCaption = null;
+      rollUpLineage = null;
       inspectCaption();
     }
   });

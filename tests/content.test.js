@@ -74,7 +74,13 @@ function createHarness(savedSettings = {}) {
       const segment =
         !replaceNodes && previousSegments[index]
           ? previousSegments[index]
-          : { textContent: "" };
+          : {
+              textContent: "",
+              parentElement: {},
+              closest(selector) {
+                return selector === ".caption-visual-line" ? this.parentElement : null;
+              }
+            };
       segment.textContent = text;
       return segment;
     });
@@ -199,6 +205,138 @@ test("caption cuộn với đoạn giao rõ ràng chỉ thêm phần mới", asy
   assert.equal(harness.spoken[1].text, "bốn");
 });
 
+test("dòng hai chuyển lên dòng một không bị đọc lại khi node DOM được tạo mới", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("Dòng một");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.setCaption("Dòng một", "Dòng hai đang đọc");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.endSpeech(0);
+
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "Dòng hai đang đọc");
+
+  // YouTube removes line 1 and recreates the old line 2 as a brand-new line 1.
+  harness.replaceCaption("Dòng hai đang đọc");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 2);
+
+  // New words now appear below/after that moved line while it is still spoken.
+  harness.replaceCaption("Dòng hai đang đọc", "Nội dung mới");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("Dòng hai đang đọc", "Nội dung mới tiếp tục");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 2);
+  harness.endSpeech(1);
+  assert.equal(harness.spoken[2].text, "Nội dung mới");
+  harness.endSpeech(2);
+  assert.equal(harness.spoken[3].text, "tiếp tục");
+  assert.equal(
+    harness.spoken.filter((utterance) => utterance.text === "Dòng hai đang đọc").length,
+    1
+  );
+});
+
+test("phần đã xếp hàng của dòng hai vẫn được nhớ sau khi dòng đó cuộn lên", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("một");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.setCaption("một", "hai");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.endSpeech(0);
+
+  assert.equal(harness.spoken[1].text, "hai");
+
+  harness.setCaption("một", "hai ba");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("hai ba");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("hai ba bốn");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 2);
+  harness.endSpeech(1);
+  assert.equal(harness.spoken[2].text, "ba");
+  harness.endSpeech(2);
+  assert.equal(harness.spoken[3].text, "bốn");
+  assert.deepEqual(
+    harness.spoken.map((utterance) => utterance.text),
+    ["một", "hai", "ba", "bốn"]
+  );
+});
+
+test("dòng cuộn bằng node mới vẫn nối đúng phần còn lại của một từ", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("một");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.setCaption("một", "hel");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.endSpeech(0);
+
+  assert.equal(harness.spoken[1].text, "hel");
+
+  harness.replaceCaption("hello");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 2);
+  harness.endSpeech(1);
+  assert.equal(harness.spoken[2].text, "lo");
+  assert.deepEqual(
+    harness.spoken.map((utterance) => utterance.text),
+    ["một", "hel", "lo"]
+  );
+});
+
+test("dòng dưới tạm biến mất vẫn giữ mốc chữ đã xếp hàng khi hiện lại", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.setCaption("A", "B");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.endSpeech(0);
+
+  harness.replaceCaption("B", "C");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("B");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("B", "C thêm");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 2);
+  harness.endSpeech(1);
+  assert.equal(harness.spoken[2].text, "C");
+  harness.endSpeech(2);
+  assert.equal(harness.spoken[3].text, "thêm");
+  assert.deepEqual(
+    harness.spoken.map((utterance) => utterance.text),
+    ["A", "B", "C", "thêm"]
+  );
+});
+
 test("node caption mới giữ nguyên câu sau dù nó lặp hai từ ở ranh giới", async () => {
   const harness = createHarness();
 
@@ -229,7 +367,7 @@ test("câu mới giống hệt nhưng dùng node DOM mới vẫn được đọc
   assert.equal(harness.spoken[1].text, "echo");
 });
 
-test("caption co lại không làm mất bản dài đang chờ hoặc đọc lặp bản ngắn", async () => {
+test("caption co lại không làm lùi mốc phần chữ đã xếp hàng", async () => {
   const harness = createHarness();
 
   harness.setCaption("hello world");
@@ -251,7 +389,7 @@ test("caption co lại không làm mất bản dài đang chờ hoặc đọc l�
   assert.equal(harness.spoken.length, 1);
   harness.endSpeech(0);
   assert.equal(harness.spoken.length, 2);
-  assert.equal(harness.spoken[1].text, "world again");
+  assert.equal(harness.spoken[1].text, "again");
 });
 
 test("caption tăng liên tục vẫn được đẩy vào FIFO trước khi mutation dừng", async () => {
