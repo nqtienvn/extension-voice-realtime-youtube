@@ -30,6 +30,30 @@
         Phụ đề được đọc tuần tự; khi FIFO tồn đọng, extension tự tăng nhẹ tốc
         độ để bám sát video.
       </p>
+
+      <section class="transcript" aria-labelledby="transcriptTitle">
+        <h2 id="transcriptTitle">Ghi phụ đề</h2>
+        <p id="transcriptStatus" aria-live="polite">
+          Đang kết nối với video…
+        </p>
+        <div class="transcript-actions">
+          <button id="transcriptButton" type="button" disabled>
+            Bắt đầu ghi
+          </button>
+          <button
+            id="transcriptDownload"
+            class="secondary"
+            type="button"
+            disabled
+          >
+            Tải TXT
+          </button>
+        </div>
+        <p>
+          Chỉ ghi phụ đề xuất hiện từ lúc bạn bấm bắt đầu. Nội dung được giữ
+          trong tab và không gửi ra mạng.
+        </p>
+      </section>
     </main>
     <script src="popup.js"></script>
   </body>

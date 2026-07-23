@@ -1,5 +1,5 @@
 :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; }
-body { width: 270px; margin: 0; background: #171717; color: #f5f5f5; }
+body { width: 300px; margin: 0; background: #171717; color: #f5f5f5; }
 main { display: grid; gap: 16px; padding: 18px; }
 label { display: grid; gap: 6px; font-weight: 600; }
 .toggle { grid-template-columns: auto 1fr; align-items: center; gap: 9px; }
@@ -7,3 +7,11 @@ input[type="range"], select { width: 100%; accent-color: #ff3030; }
 select { padding: 7px; border: 1px solid #555; border-radius: 6px; background: #282828; color: inherit; }
 output { color: #bbb; font-weight: 400; }
 p { margin: 0; color: #aaa; font-size: 12px; }
+.transcript { display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid #3d3d3d; }
+h2 { margin: 0; font-size: 14px; }
+.transcript-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+button { min-height: 34px; padding: 7px 10px; border: 0; border-radius: 6px; background: #ff3030; color: #fff; font: inherit; font-weight: 650; cursor: pointer; }
+button.secondary { border: 1px solid #555; background: #282828; }
+button:disabled { opacity: .5; cursor: default; }
+#transcriptStatus[data-state="recording"] { color: #7ee787; }
+#transcriptStatus[data-state="error"] { color: #ff9b9b; }

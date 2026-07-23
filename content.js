@@ -24,6 +24,13 @@
   const CAPTION_MAX_WAIT_MS = 180;
   const SPEECH_BATCH_SETTLE_MS = 260;
   const SPEECH_BATCH_MAX_WAIT_MS = 550;
+  const TRANSCRIPT_MESSAGES = Object.freeze({
+    GET_STATE: "transcript:getState",
+    START: "transcript:start",
+    STOP: "transcript:stop",
+    CLEAR: "transcript:clear",
+    EXPORT: "transcript:export"
+  });
 
   let settings = { ...DEFAULTS };
   let displayedCaption = { text: "", nodes: [], lines: [] };
@@ -46,6 +53,7 @@
   let voiceLoadWaitTimer = null;
   let voiceLoadWaitFinished = false;
   const voiceLoadWaitDeadline = Date.now() + VOICE_LOAD_WAIT_MS;
+  let transcriptSession = createEmptyTranscriptSession();
 
   function normalize(text) {
     return String(text ?? "")
@@ -161,6 +169,345 @@
       nodes,
       lines
     };
+  }
+
+  function createEmptyTranscriptSession() {
+    return {
+      recording: false,
+      entries: [],
+      videoKey: "",
+      videoId: "",
+      videoTitle: "",
+      videoUrl: "",
+      startedAt: "",
+      entryBoundaryPending: false,
+      stoppedBecauseVideoChanged: false
+    };
+  }
+
+  function decodedUrlPart(value) {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+
+  function currentVideoMetadata() {
+    const href =
+      typeof location === "object" && typeof location.href === "string"
+        ? location.href
+        : "";
+    const queryVideoId = href.match(/[?&]v=([^&#]+)/u);
+    const pathVideoId = href.match(/\/(?:shorts|live)\/([^/?#&]+)/u);
+    const videoId = decodedUrlPart(
+      (queryVideoId && queryVideoId[1]) ||
+        (pathVideoId && pathVideoId[1]) ||
+        ""
+    );
+    const rawTitle =
+      typeof document.title === "string" ? document.title : "YouTube";
+    const videoTitle =
+      normalize(rawTitle.replace(/\s*-\s*YouTube\s*$/iu, "")) || "YouTube";
+
+    return {
+      videoKey: videoId
+        ? `video:${videoId}`
+        : `page:${href.split("#", 1)[0] || "youtube"}`,
+      videoId,
+      videoTitle,
+      videoUrl: videoId
+        ? `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`
+        : href
+    };
+  }
+
+  function currentVideoTime() {
+    const video =
+      typeof document.querySelector === "function"
+        ? document.querySelector("video")
+        : null;
+    const value = Number(video && video.currentTime);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+
+  function initializeTranscriptSession(metadata = currentVideoMetadata()) {
+    transcriptSession = {
+      ...createEmptyTranscriptSession(),
+      videoKey: metadata.videoKey,
+      videoId: metadata.videoId,
+      videoTitle: metadata.videoTitle,
+      videoUrl: metadata.videoUrl,
+      startedAt: new Date().toISOString()
+    };
+  }
+
+  function transcriptMatchesCurrentVideo() {
+    if (!transcriptSession.videoKey) return true;
+    const matches =
+      currentVideoMetadata().videoKey === transcriptSession.videoKey;
+    if (!matches && transcriptSession.recording) {
+      transcriptSession.recording = false;
+      transcriptSession.stoppedBecauseVideoChanged = true;
+    }
+    return matches;
+  }
+
+  function transcriptWordCount() {
+    return transcriptSession.entries.reduce(
+      (count, entry) =>
+        count + entry.text.split(/\s+/u).filter(Boolean).length,
+      0
+    );
+  }
+
+  function transcriptState() {
+    transcriptMatchesCurrentVideo();
+    return {
+      recording: transcriptSession.recording,
+      hasContent: transcriptSession.entries.length > 0,
+      entryCount: transcriptSession.entries.length,
+      wordCount: transcriptWordCount(),
+      startedAt: transcriptSession.startedAt,
+      videoId: transcriptSession.videoId,
+      videoTitle: transcriptSession.videoTitle,
+      stoppedBecauseVideoChanged: transcriptSession.stoppedBecauseVideoChanged
+    };
+  }
+
+  function transcriptEndsWithCaption(text) {
+    const caption = normalize(text);
+    const lastEntry = transcriptSession.entries.at(-1);
+    if (!caption || !lastEntry) return false;
+    return (
+      lastEntry.text === caption ||
+      lastEntry.text.endsWith(` ${caption}`)
+    );
+  }
+
+  function recordTranscriptAddition(
+    text,
+    attachToPrevious = false,
+    startsNewEntry = false
+  ) {
+    const addition = normalize(text);
+    if (
+      !transcriptSession.recording ||
+      !transcriptMatchesCurrentVideo() ||
+      !addition
+    ) {
+      return;
+    }
+
+    const playbackTime = currentVideoTime();
+    const lastEntry = transcriptSession.entries.at(-1);
+    if (
+      !lastEntry ||
+      startsNewEntry ||
+      transcriptSession.entryBoundaryPending
+    ) {
+      transcriptSession.entries.push({
+        startSeconds: playbackTime,
+        endSeconds: playbackTime,
+        text: addition
+      });
+      transcriptSession.entryBoundaryPending = false;
+      return;
+    }
+
+    lastEntry.text = appendSpeechText(
+      lastEntry.text,
+      addition,
+      attachToPrevious
+    );
+    lastEntry.endSeconds = Math.max(lastEntry.endSeconds, playbackTime);
+  }
+
+  function isLikelyTranscriptCaptionRevision(previousText, currentText) {
+    if (isLikelyTrailingWordCorrection(previousText, currentText)) return true;
+    if (previousText.startsWith(currentText)) return false;
+
+    const previousWords = previousText.split(" ");
+    const currentWords = currentText.split(" ");
+    if (
+      previousWords.length === currentWords.length ||
+      !previousWords.length ||
+      !currentWords.length
+    ) {
+      return false;
+    }
+
+    const shorterLength = Math.min(
+      previousWords.length,
+      currentWords.length
+    );
+    let sharedPrefix = 0;
+    while (
+      sharedPrefix < shorterLength &&
+      previousWords[sharedPrefix] === currentWords[sharedPrefix]
+    ) {
+      sharedPrefix += 1;
+    }
+
+    let sharedSuffix = 0;
+    while (
+      sharedPrefix + sharedSuffix < shorterLength &&
+      previousWords[previousWords.length - 1 - sharedSuffix] ===
+        currentWords[currentWords.length - 1 - sharedSuffix]
+    ) {
+      sharedSuffix += 1;
+    }
+
+    const unchangedWords = sharedPrefix + sharedSuffix;
+    return unchangedWords >= 2 && unchangedWords / shorterLength >= 0.75;
+  }
+
+  function replaceTranscriptCaptionRevision(previousText, currentText) {
+    if (
+      !transcriptSession.recording ||
+      !transcriptMatchesCurrentVideo() ||
+      !isLikelyTranscriptCaptionRevision(previousText, currentText)
+    ) {
+      return false;
+    }
+
+    const previous = normalize(previousText);
+    const current = normalize(currentText);
+    const lastEntry = transcriptSession.entries.at(-1);
+    if (!previous || !current || !lastEntry.text.endsWith(previous)) {
+      return false;
+    }
+
+    lastEntry.text = normalize(
+      `${lastEntry.text.slice(0, -previous.length)}${current}`
+    );
+    lastEntry.endSeconds = Math.max(lastEntry.endSeconds, currentVideoTime());
+    return true;
+  }
+
+  function formatPlaybackTime(value) {
+    const totalSeconds = Math.max(0, Math.floor(Number(value) || 0));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return [hours, minutes, seconds]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+  }
+
+  function safeFilenamePart(value, fallback) {
+    const safe = normalize(value)
+      .replace(/[<>:"/\\|?*\u0000-\u001F]/gu, "-")
+      .replace(/\s+/gu, "-")
+      .replace(/-+/gu, "-")
+      .replace(/^[.\s-]+|[.\s-]+$/gu, "")
+      .slice(0, 80);
+    return safe || fallback;
+  }
+
+  function transcriptFilename() {
+    const title = safeFilenamePart(
+      transcriptSession.videoTitle,
+      "youtube"
+    );
+    const videoId = safeFilenamePart(
+      transcriptSession.videoId,
+      "khong-ro-video"
+    );
+    const timestamp = (transcriptSession.startedAt || new Date().toISOString())
+      .replace(/\.\d{3}Z$/u, "Z")
+      .replace(/[:T]/gu, "-");
+    return `youtube-phu-de_${title}_${videoId}_${timestamp}.txt`;
+  }
+
+  function transcriptExportContent() {
+    const lines = [
+      "BẢN GHI PHỤ ĐỀ YOUTUBE",
+      `Tiêu đề: ${transcriptSession.videoTitle || "YouTube"}`,
+      `Video: ${transcriptSession.videoUrl || ""}`,
+      `Bắt đầu ghi: ${transcriptSession.startedAt || ""}`,
+      ""
+    ];
+
+    for (const entry of transcriptSession.entries) {
+      lines.push(`[${formatPlaybackTime(entry.startSeconds)}] ${entry.text}`);
+    }
+    return lines.join("\r\n");
+  }
+
+  function startTranscript(resetExisting = false) {
+    // Commit the latest debounced caption before taking the starting snapshot,
+    // so the snapshot and future caption deltas share the same watermark.
+    flushScheduledCaption();
+    const metadata = currentVideoMetadata();
+    if (
+      resetExisting ||
+      !transcriptSession.videoKey ||
+      transcriptSession.videoKey !== metadata.videoKey
+    ) {
+      initializeTranscriptSession(metadata);
+    }
+
+    transcriptSession.recording = true;
+    transcriptSession.stoppedBecauseVideoChanged = false;
+    const caption = currentCaption();
+    if (caption.text && !transcriptEndsWithCaption(caption.text)) {
+      recordTranscriptAddition(caption.text, false, true);
+    }
+    return transcriptState();
+  }
+
+  function stopTranscript() {
+    if (transcriptSession.recording) flushScheduledCaption();
+    transcriptSession.recording = false;
+    return transcriptState();
+  }
+
+  function clearTranscript() {
+    transcriptSession = createEmptyTranscriptSession();
+    return transcriptState();
+  }
+
+  function handleTranscriptMessage(message, _sender, sendResponse) {
+    if (!message || typeof message.type !== "string") return false;
+
+    if (message.type === TRANSCRIPT_MESSAGES.GET_STATE) {
+      sendResponse({ ok: true, state: transcriptState() });
+      return false;
+    }
+    if (message.type === TRANSCRIPT_MESSAGES.START) {
+      sendResponse({
+        ok: true,
+        state: startTranscript(Boolean(message.reset))
+      });
+      return false;
+    }
+    if (message.type === TRANSCRIPT_MESSAGES.STOP) {
+      sendResponse({ ok: true, state: stopTranscript() });
+      return false;
+    }
+    if (message.type === TRANSCRIPT_MESSAGES.CLEAR) {
+      sendResponse({ ok: true, state: clearTranscript() });
+      return false;
+    }
+    if (message.type === TRANSCRIPT_MESSAGES.EXPORT) {
+      if (transcriptSession.recording) flushScheduledCaption();
+      if (!transcriptSession.entries.length) {
+        sendResponse({
+          ok: false,
+          error: "Chưa có phụ đề nào trong bản ghi."
+        });
+        return false;
+      }
+      sendResponse({
+        ok: true,
+        content: transcriptExportContent(),
+        filename: transcriptFilename(),
+        state: transcriptState()
+      });
+      return false;
+    }
+    return false;
   }
 
   function sharesCaptionNode(first, second) {
@@ -793,6 +1140,10 @@
     if (lineageResult) {
       rollUpLineage = lineageResult.committedLines;
       displayedCaption = caption;
+      recordTranscriptAddition(
+        lineageResult.addition,
+        lineageResult.attachToPrevious
+      );
       enqueueSpeech(
         lineageResult.addition,
         lineageResult.attachToPrevious
@@ -800,8 +1151,18 @@
       return;
     }
 
+    const sharesCurrentCaptionNode = sharesCaptionNode(
+      displayedCaption,
+      caption
+    );
+    const transcriptCorrectionHandled =
+      sharesCurrentCaptionNode &&
+      replaceTranscriptCaptionRevision(
+        displayedCaption.text,
+        caption.text
+      );
     if (
-      sharesCaptionNode(displayedCaption, caption) &&
+      sharesCurrentCaptionNode &&
       replacePendingDraftCorrection(displayedCaption.text, caption.text)
     ) {
       displayedCaption = caption;
@@ -821,6 +1182,9 @@
     // restored suffix would be queued and spoken a second time.
     if (!isTransientSameLineShrink(displayedCaption, caption)) {
       displayedCaption = caption;
+    }
+    if (!transcriptCorrectionHandled) {
+      recordTranscriptAddition(addition, attachToPrevious, startsNewEntry);
     }
     enqueueSpeech(addition, attachToPrevious, startsNewEntry);
   }
@@ -897,6 +1261,9 @@
       // A later identical sentence is a new caption and must be read again.
       displayedCaption = { text: "", nodes: [], lines: [] };
       rollUpLineage = null;
+      if (transcriptSession.recording && transcriptSession.entries.length) {
+        transcriptSession.entryBoundaryPending = true;
+      }
       return;
     }
 
@@ -999,6 +1366,14 @@
       pumpSpeechQueue();
     }
   });
+
+  if (
+    chrome.runtime &&
+    chrome.runtime.onMessage &&
+    typeof chrome.runtime.onMessage.addListener === "function"
+  ) {
+    chrome.runtime.onMessage.addListener(handleTranscriptMessage);
+  }
 
   if (typeof speechSynthesis.addEventListener === "function") {
     speechSynthesis.addEventListener("voiceschanged", () => {

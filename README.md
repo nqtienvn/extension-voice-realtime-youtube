@@ -25,12 +25,30 @@ từ `900` xuống `550 ms`. Danh sách voice được tải trước từ `docu
 khi FIFO có nhiều caption chờ, tốc độ đọc được tăng thích ứng tối đa `30%` để
 giảm tụt hậu mà không bỏ nội dung.
 
+## Ghi và tải phụ đề
+
+Từ phiên bản `0.3.0`, popup có mục **Ghi phụ đề**:
+
+1. Bấm **Bắt đầu ghi** khi video đang bật phụ đề.
+2. Extension ghi các caption đã ổn định, chống lặp khi YouTube cuộn dòng và cập
+   nhật lại từ cuối do ASR.
+3. Bấm **Dừng & tải TXT** để dừng phiên và tải ngay tệp văn bản UTF-8; nút
+   **Tải TXT** cho phép tải một bản chụp trong lúc vẫn đang ghi.
+
+Bản ghi có thời gian phát video, tiêu đề và URL. Dữ liệu chỉ nằm trong bộ nhớ
+của tab hiện tại, không được đưa vào `storage.sync` và không gửi ra mạng. Vì
+extension đọc phần phụ đề đang hiển thị, nó chỉ ghi được nội dung xuất hiện từ
+lúc bấm bắt đầu; tải lại hoặc đóng tab sẽ xóa phiên chưa tải. Nếu YouTube chuyển
+sang video khác trong cùng tab, phiên cũ tự dừng và popup sẽ tải bản cũ trước
+khi bắt đầu ghi video mới.
+
 ## Cài thử
 
 1. Mở `chrome://extensions`.
 2. Bật **Developer mode**.
 3. Chọn **Load unpacked** và trỏ tới thư mục này.
-4. Mở một video YouTube, bật CC, sau đó bật **Đọc phụ đề** trong popup extension.
+4. Mở một video YouTube, bật CC, sau đó dùng **Đọc phụ đề** hoặc
+   **Ghi phụ đề** trong popup extension.
 
 ## Độ trễ
 

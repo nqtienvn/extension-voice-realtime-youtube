@@ -9,7 +9,9 @@ const CONTENT_SCRIPT = fs.readFileSync(path.join(__dirname, "..", "content.js"),
 function createHarness(savedSettings = {}, availableVoices = []) {
   let captionSegments = [];
   let storageListener = null;
+  let runtimeListener = null;
   let cancelCount = 0;
+  let currentVideoTime = 0;
   let currentVoices = [...availableVoices];
   const observers = [];
   const spoken = [];
@@ -56,9 +58,16 @@ function createHarness(savedSettings = {}, availableVoices = []) {
   const document = {
     body: {},
     documentElement: { lang: "vi" },
+    title: "Video thử nghiệm - YouTube",
+    querySelector(selector) {
+      return selector === "video" ? { currentTime: currentVideoTime } : null;
+    },
     querySelectorAll() {
       return captionSegments;
     }
+  };
+  const location = {
+    href: "https://www.youtube.com/watch?v=video-thu-nghiem"
   };
 
   const chrome = {
@@ -75,6 +84,13 @@ function createHarness(savedSettings = {}, availableVoices = []) {
       onChanged: {
         addListener(listener) {
           storageListener = listener;
+        }
+      }
+    },
+    runtime: {
+      onMessage: {
+        addListener(listener) {
+          runtimeListener = listener;
         }
       }
     }
@@ -103,6 +119,7 @@ function createHarness(savedSettings = {}, availableVoices = []) {
     chrome,
     clearTimeout,
     document,
+    location,
     MutationObserver: FakeMutationObserver,
     navigator: { language: "vi-VN" },
     setTimeout,
@@ -117,6 +134,18 @@ function createHarness(savedSettings = {}, availableVoices = []) {
     spoken,
     spokenAt,
     storageWrites,
+    sendRuntimeMessage(message) {
+      let response;
+      runtimeListener(message, {}, (value) => {
+        response = value;
+      });
+      return response;
+    },
+    setVideo({ href, title, time } = {}) {
+      if (typeof href === "string") location.href = href;
+      if (typeof title === "string") document.title = title;
+      if (Number.isFinite(time)) currentVideoTime = time;
+    },
     changeSettings(changes) {
       const storageChanges = Object.fromEntries(
         Object.entries(changes).map(([key, value]) => [key, { newValue: value }])
@@ -1150,4 +1179,205 @@ test("tự tăng nhẹ tốc độ khi FIFO có nhiều caption đang chờ", as
   harness.endSpeech(0);
   assert.equal(harness.spoken[1].text, "B");
   assert.equal(harness.spoken[1].rate, 1.1);
+});
+
+test("ghi phụ đề độc lập với TTS và thay bản nháp bằng tiếng Việt đã sửa dấu", async () => {
+  const harness = createHarness({
+    enabled: false,
+    ttsSettingsVersion: 1
+  });
+
+  const started = harness.sendRuntimeMessage({
+    type: "transcript:start"
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.state.recording, true);
+
+  harness.setVideo({ time: 12 });
+  harness.setCaption("toi di hoc");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.setCaption("tôi đi học");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.setVideo({ time: 15 });
+  harness.setCaption("tôi đi học hôm nay");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.equal(exported.ok, true);
+  assert.match(exported.content, /\[00:00:12\] tôi đi học hôm nay/);
+  assert.doesNotMatch(exported.content, /toi di hoc/);
+  assert.equal(exported.state.entryCount, 1);
+  assert.equal(exported.state.wordCount, 5);
+  assert.equal(harness.spoken.length, 0);
+});
+
+test("dừng hoặc tải ngay vẫn chốt caption còn trong cửa sổ debounce", () => {
+  const stoppedHarness = createHarness({ enabled: false });
+  stoppedHarness.sendRuntimeMessage({ type: "transcript:start" });
+  stoppedHarness.setVideo({ time: 7 });
+  stoppedHarness.setCaption("Caption vừa xuất hiện");
+  stoppedHarness.mutate();
+
+  const stopped = stoppedHarness.sendRuntimeMessage({
+    type: "transcript:stop"
+  });
+  assert.equal(stopped.state.entryCount, 1);
+  const stoppedExport = stoppedHarness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.match(stoppedExport.content, /\[00:00:07\] Caption vừa xuất hiện/);
+
+  const liveHarness = createHarness({ enabled: false });
+  liveHarness.sendRuntimeMessage({ type: "transcript:start" });
+  liveHarness.setCaption("Caption tải tức thì");
+  liveHarness.mutate();
+  const liveExport = liveHarness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.match(liveExport.content, /Caption tải tức thì/);
+  assert.equal(liveExport.state.recording, true);
+});
+
+test("khoảng trống giữa hai cue tạo đoạn và timestamp mới", async () => {
+  const harness = createHarness({ enabled: false });
+  harness.sendRuntimeMessage({ type: "transcript:start" });
+
+  harness.setVideo({ time: 1 });
+  harness.setCaption("Cue đầu");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.setCaption();
+  harness.mutate();
+  harness.setVideo({ time: 5 });
+  harness.replaceCaption("Cue sau");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.equal(exported.state.entryCount, 2);
+  assert.match(exported.content, /\[00:00:01\] Cue đầu/);
+  assert.match(exported.content, /\[00:00:05\] Cue sau/);
+  assert.doesNotMatch(exported.content, /Cue đầu Cue sau/);
+});
+
+test("ASR chèn nhiều từ trong cùng cue sẽ sửa bản ghi thay vì nối hai bản", async () => {
+  const harness = createHarness({ enabled: false });
+  harness.sendRuntimeMessage({ type: "transcript:start" });
+
+  harness.setCaption("tôi đi học");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  harness.setCaption("tôi đã đi học");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.equal(exported.state.entryCount, 1);
+  assert.equal(exported.state.wordCount, 4);
+  assert.match(exported.content, /\] tôi đã đi học/);
+  assert.doesNotMatch(exported.content, /tôi đi học tôi đã đi học/);
+});
+
+test("bản ghi giữ caption mới giống hệt nhưng không ghi thêm sau khi dừng", async () => {
+  const harness = createHarness({ enabled: false });
+
+  harness.sendRuntimeMessage({ type: "transcript:start" });
+  harness.setVideo({ time: 1 });
+  harness.setCaption("lặp lại");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.setVideo({ time: 3 });
+  harness.replaceCaption("lặp lại");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const stopped = harness.sendRuntimeMessage({
+    type: "transcript:stop"
+  });
+  assert.equal(stopped.state.recording, false);
+  assert.equal(stopped.state.entryCount, 2);
+
+  harness.replaceCaption("không được ghi");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.equal(
+    exported.content.match(/\] lặp lại/g).length,
+    2
+  );
+  assert.doesNotMatch(exported.content, /không được ghi/);
+});
+
+test("bắt đầu ghi chụp cả caption đang hiển thị và xuất tên tệp an toàn", async () => {
+  const harness = createHarness({ enabled: false });
+
+  harness.setVideo({
+    href: "https://www.youtube.com/watch?v=abc-123",
+    title: "Tiêu đề: thử / video - YouTube",
+    time: 42
+  });
+  harness.setCaption("Nội dung đang hiển thị");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const started = harness.sendRuntimeMessage({
+    type: "transcript:start"
+  });
+  assert.equal(started.state.entryCount, 1);
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.match(exported.content, /Tiêu đề: Tiêu đề: thử \/ video/);
+  assert.match(exported.content, /\[00:00:42\] Nội dung đang hiển thị/);
+  assert.match(exported.filename, /^youtube-phu-de_/);
+  assert.match(exported.filename, /abc-123/);
+  assert.doesNotMatch(exported.filename, /[:/\\]/);
+  assert.match(exported.filename, /\.txt$/);
+});
+
+test("đổi video tự dừng bản ghi và không trộn phụ đề của video mới", async () => {
+  const harness = createHarness({ enabled: false });
+
+  harness.sendRuntimeMessage({ type: "transcript:start" });
+  harness.setCaption("Nội dung video đầu");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.setVideo({
+    href: "https://www.youtube.com/watch?v=video-moi",
+    title: "Video mới - YouTube",
+    time: 2
+  });
+  harness.replaceCaption("Nội dung video mới");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  const status = harness.sendRuntimeMessage({
+    type: "transcript:getState"
+  });
+  assert.equal(status.state.recording, false);
+  assert.equal(status.state.stoppedBecauseVideoChanged, true);
+
+  const exported = harness.sendRuntimeMessage({
+    type: "transcript:export"
+  });
+  assert.match(exported.content, /Nội dung video đầu/);
+  assert.doesNotMatch(exported.content, /Nội dung video mới/);
 });
