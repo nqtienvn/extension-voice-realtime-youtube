@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YouTube Caption Voice",
-  "version": "0.3.0",
-  "description": "Đọc phụ đề YouTube bằng giọng tiếng Việt và ghi lại nội dung để tải xuống.",
+  "version": "0.3.2",
+  "description": "Đọc phụ đề YouTube bằng giọng tùy chọn và ghi lại nội dung để tải xuống.",
   "permissions": ["storage"],
   "host_permissions": ["https://youtube.com/*", "https://*.youtube.com/*"],
   "action": {

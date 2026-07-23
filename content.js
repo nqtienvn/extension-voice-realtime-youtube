@@ -18,12 +18,14 @@
     pitch: 1,
     volume: 1,
     voiceURI: "",
+    allowAnyVoice: false,
     ttsSettingsVersion: 0
   };
   const CAPTION_SETTLE_MS = 40;
   const CAPTION_MAX_WAIT_MS = 180;
   const SPEECH_BATCH_SETTLE_MS = 260;
   const SPEECH_BATCH_MAX_WAIT_MS = 550;
+  const SPEECH_PAUSE_GRACE_MS = 320;
   const TRANSCRIPT_MESSAGES = Object.freeze({
     GET_STATE: "transcript:getState",
     START: "transcript:start",
@@ -36,23 +38,30 @@
   let displayedCaption = { text: "", nodes: [], lines: [] };
   let observedCaption = { text: "", nodes: [], lines: [] };
   let scheduledCaption = null;
+  let scheduledCaptionResumesAfterShortGap = false;
   let captionTimer = null;
   let captionDeadlineTimer = null;
   let captionMutationPending = false;
   const speechQueue = [];
+  const speechQueueCueCounts = [];
   let activeUtterance = null;
   let speechGeneration = 0;
   let pendingSpeechText = "";
   let pendingSpeechAttachesToPrevious = false;
   let pendingSpeechStartsNewEntry = false;
+  let pendingSpeechStartsNewCaption = false;
+  let pendingSpeechCueCount = 0;
   let pendingTailHasQueuedStablePrefix = false;
   let speechBatchTimer = null;
   let speechBatchDeadlineTimer = null;
+  let speechBatchDeadlineAt = 0;
+  let captionGapTimer = null;
+  let speechBoundaryBeforeNextText = false;
   let rollUpLineage = null;
   let observer = null;
   let voiceLoadWaitTimer = null;
   let voiceLoadWaitFinished = false;
-  const voiceLoadWaitDeadline = Date.now() + VOICE_LOAD_WAIT_MS;
+  let voiceLoadWaitDeadline = Date.now() + VOICE_LOAD_WAIT_MS;
   let transcriptSession = createEmptyTranscriptSession();
 
   function normalize(text) {
@@ -123,6 +132,10 @@
     return normalize(
       attachToPrevious ? `${base}${addition}` : `${base} ${addition}`
     );
+  }
+
+  function endsNaturalSpeechPhrase(text) {
+    return /[.!?…](?:["'”’»)\]}]+)?$/u.test(normalize(text));
   }
 
   function currentCaption() {
@@ -569,7 +582,8 @@
 
   function requestedVoice() {
     const voice = configuredVoice();
-    return voice && isVietnameseVoice(voice) ? voice : null;
+    if (!voice) return null;
+    return settings.allowAnyVoice || isVietnameseVoice(voice) ? voice : null;
   }
 
   function selectedVoice() {
@@ -633,12 +647,19 @@
     let speechText = "";
     while (speechQueue.length && !speechText) {
       speechText = prepareSpeechText(speechQueue[0]);
-      if (!speechText) speechQueue.shift();
+      if (!speechText) {
+        speechQueue.shift();
+        speechQueueCueCounts.shift();
+      }
     }
     if (!speechText || shouldWaitForRequestedVoice()) return;
 
-    const backlogDepth = speechQueue.length;
+    const backlogDepth = speechQueueCueCounts.reduce(
+      (total, count) => total + count,
+      0
+    );
     speechQueue.shift();
+    speechQueueCueCounts.shift();
     const utterance = createUtterance(speechText, backlogDepth);
     const generation = speechGeneration;
     activeUtterance = utterance;
@@ -648,12 +669,23 @@
       // callback so it cannot consume an item from the new queue.
       if (generation !== speechGeneration || activeUtterance !== utterance) return;
       activeUtterance = null;
+      if (
+        !captionGapTimer &&
+        speechQueue.length &&
+        pendingSpeechText &&
+        pendingSpeechStartsNewCaption &&
+        splitStableSpeechPrefix(pendingSpeechText).stableText
+      ) {
+        // A later cue is already known. Merge every complete word into the
+        // queued phrase before playback resumes, while retaining its draft tail.
+        flushSpeechBuffer(false);
+      }
       // If a fragment is still inside the coalescing window, let its timer merge
       // it into the queued phrase before starting the next utterance.
       if (
-        !pendingSpeechText ||
-        pendingTailHasQueuedStablePrefix ||
-        pendingSpeechStartsNewEntry
+        (!pendingSpeechText ||
+          pendingTailHasQueuedStablePrefix ||
+          pendingSpeechStartsNewEntry)
       ) {
         pumpSpeechQueue();
       }
@@ -710,6 +742,7 @@
     }
     if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
     speechBatchDeadlineTimer = null;
+    speechBatchDeadlineAt = 0;
 
     if (!pendingSpeechText) return;
 
@@ -719,7 +752,11 @@
     const textToQueue = split.stableText;
     const attachToPrevious = pendingSpeechAttachesToPrevious;
     const startsNewEntry = pendingSpeechStartsNewEntry;
+    const startsNewCaption = pendingSpeechStartsNewCaption;
+    const cueCount = pendingSpeechCueCount;
     const retainedTrailingText = Boolean(split.trailingText);
+    const endsPhrase =
+      !retainedTrailingText && endsNaturalSpeechPhrase(textToQueue);
 
     pendingSpeechText = split.trailingText;
 
@@ -729,6 +766,8 @@
       // an artificial space.
       pendingSpeechAttachesToPrevious = attachToPrevious;
       pendingSpeechStartsNewEntry = startsNewEntry;
+      pendingSpeechStartsNewCaption = startsNewCaption;
+      pendingSpeechCueCount = cueCount;
       pendingTailHasQueuedStablePrefix =
         pendingTailHasQueuedStablePrefix ||
         (speechQueue.length > 0 && !attachToPrevious);
@@ -745,6 +784,8 @@
 
     pendingSpeechAttachesToPrevious = false;
     pendingSpeechStartsNewEntry = false;
+    pendingSpeechStartsNewCaption = false;
+    pendingSpeechCueCount = 0;
     pendingTailHasQueuedStablePrefix = retainedTrailingText;
 
     if (speechQueue.length && !startsNewEntry) {
@@ -754,11 +795,14 @@
         textToQueue,
         attachToPrevious
       );
+      speechQueueCueCounts[lastIndex] += cueCount;
     } else {
       speechQueue.push(textToQueue);
+      speechQueueCueCounts.push(Math.max(1, cueCount));
     }
 
     pumpSpeechQueue();
+    if (endsPhrase) speechBoundaryBeforeNextText = true;
     if (pendingSpeechText) {
       if (!speechBatchTimer) {
         speechBatchTimer = setTimeout(
@@ -778,9 +822,16 @@
     // flushes only complete-word prefixes. A trailing draft token keeps the
     // ordinary settle window instead of being forced out mid-update.
     if (!speechBatchDeadlineTimer) {
+      if (!speechBatchDeadlineAt) {
+        speechBatchDeadlineAt = Date.now() + SPEECH_BATCH_MAX_WAIT_MS;
+      }
+      const remainingWait = Math.max(0, speechBatchDeadlineAt - Date.now());
       speechBatchDeadlineTimer = setTimeout(
-        () => flushSpeechBuffer(false),
-        SPEECH_BATCH_MAX_WAIT_MS
+        () => {
+          speechBatchDeadlineTimer = null;
+          flushSpeechBuffer(false);
+        },
+        remainingWait
       );
     }
   }
@@ -806,17 +857,29 @@
   function enqueueSpeech(
     text,
     attachToPrevious = false,
-    startsNewEntry = false
+    startsNewCaption = false
   ) {
     const addition = normalize(text);
     if (!settings.enabled || !addition) return;
 
-    if (startsNewEntry && pendingSpeechText) flushSpeechBuffer();
+    // DOM cue/node changes are only visual boundaries. Unsent text keeps
+    // coalescing until punctuation, a sustained gap, or a latency timer seals it.
+    if (
+      pendingSpeechText &&
+      (speechBoundaryBeforeNextText ||
+        endsNaturalSpeechPhrase(pendingSpeechText))
+    ) {
+      flushSpeechBuffer();
+    }
+    const startsNewEntry = speechBoundaryBeforeNextText;
+    speechBoundaryBeforeNextText = false;
 
     if (!pendingSpeechText) {
       pendingSpeechText = addition;
       pendingSpeechAttachesToPrevious = attachToPrevious;
       pendingSpeechStartsNewEntry = startsNewEntry;
+      pendingSpeechStartsNewCaption = startsNewCaption;
+      pendingSpeechCueCount = 1;
       pendingTailHasQueuedStablePrefix = false;
     } else {
       pendingSpeechText = appendSpeechText(
@@ -824,9 +887,53 @@
         addition,
         attachToPrevious
       );
+      if (startsNewCaption) {
+        pendingSpeechStartsNewCaption = true;
+        pendingSpeechCueCount += 1;
+      }
     }
 
     scheduleSpeechBufferFlush();
+  }
+
+  function cancelCaptionGapBoundary() {
+    if (!captionGapTimer) return false;
+    clearTimeout(captionGapTimer);
+    captionGapTimer = null;
+    if (pendingSpeechText) {
+      if (speechBatchTimer) clearTimeout(speechBatchTimer);
+      speechBatchTimer = setTimeout(
+        () => flushSpeechBuffer(true),
+        CAPTION_SETTLE_MS + SPEECH_BATCH_SETTLE_MS
+      );
+    }
+    return true;
+  }
+
+  function commitCaptionGapBoundary() {
+    captionGapTimer = null;
+    flushSpeechBuffer();
+    speechBoundaryBeforeNextText = true;
+    displayedCaption = { text: "", nodes: [], lines: [] };
+    rollUpLineage = null;
+    if (transcriptSession.recording && transcriptSession.entries.length) {
+      transcriptSession.entryBoundaryPending = true;
+    }
+  }
+
+  function scheduleCaptionGapBoundary() {
+    if (captionGapTimer) return;
+
+    // A short empty frame is normally YouTube replacing one caption node with
+    // another, not the speaker pausing. Hold the current phrase through it.
+    if (speechBatchTimer) clearTimeout(speechBatchTimer);
+    speechBatchTimer = null;
+    if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
+    speechBatchDeadlineTimer = null;
+    captionGapTimer = setTimeout(
+      commitCaptionGapBoundary,
+      SPEECH_PAUSE_GRACE_MS
+    );
   }
 
   function clearSpeechQueue() {
@@ -834,12 +941,17 @@
     speechBatchTimer = null;
     if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
     speechBatchDeadlineTimer = null;
+    speechBoundaryBeforeNextText = false;
+    speechBatchDeadlineAt = 0;
     pendingSpeechText = "";
     pendingSpeechAttachesToPrevious = false;
     pendingSpeechStartsNewEntry = false;
+    pendingSpeechStartsNewCaption = false;
+    pendingSpeechCueCount = 0;
     pendingTailHasQueuedStablePrefix = false;
     captionMutationPending = false;
     speechQueue.length = 0;
+    speechQueueCueCounts.length = 0;
     speechGeneration += 1;
     activeUtterance = null;
     if (voiceLoadWaitTimer) clearTimeout(voiceLoadWaitTimer);
@@ -1022,6 +1134,61 @@
     return rawAddition.length > 0 && !/^\s/.test(rawAddition);
   }
 
+  function isSameCaptionAfterShortGap(previousCaption, currentCaptionSnapshot) {
+    const previous = previousCaption.text;
+    const current = currentCaptionSnapshot.text;
+    if (!previous || !current) return false;
+    return (
+      (previous !== current &&
+        (current.startsWith(previous) || previous.startsWith(current))) ||
+      isLikelyTrailingWordCorrection(previous, current)
+    );
+  }
+
+  function captionAdditionAfterShortGap(
+    previousCaption,
+    currentCaptionSnapshot
+  ) {
+    const previous = previousCaption.text;
+    const current = currentCaptionSnapshot.text;
+    if (current === previous || previous.startsWith(current)) return "";
+    if (current.startsWith(previous)) {
+      return normalize(current.slice(previous.length));
+    }
+    // A likely ASR correction is handled in the pending speech/transcript
+    // replacement paths. If it is already too late to replace, do not read both
+    // the draft and corrected full caption.
+    if (isLikelyTrailingWordCorrection(previous, current)) return "";
+    return current;
+  }
+
+  function captionAdditionAfterShortGapAttaches(
+    previousCaption,
+    currentCaptionSnapshot
+  ) {
+    if (!currentCaptionSnapshot.text.startsWith(previousCaption.text)) {
+      return false;
+    }
+    const rawAddition = currentCaptionSnapshot.text.slice(
+      previousCaption.text.length
+    );
+    return rawAddition.length > 0 && !/^\s/u.test(rawAddition);
+  }
+
+  function preserveCaptionWatermarkOnNewNodes(
+    previousCaption,
+    currentCaptionSnapshot
+  ) {
+    return {
+      text: previousCaption.text,
+      nodes: currentCaptionSnapshot.nodes,
+      lines: previousCaption.lines.map((line, index) => ({
+        ...line,
+        node: currentCaptionSnapshot.lines[index]?.node || line.node
+      }))
+    };
+  }
+
   function isTransientSameLineShrink(previousCaption, currentCaptionSnapshot) {
     if (
       previousCaption.lines.length !== currentCaptionSnapshot.lines.length ||
@@ -1127,14 +1294,20 @@
     return true;
   }
 
-  function processCaption(caption) {
-    let lineageResult = rollUpLineage
-      ? applyRollUpLineage(rollUpLineage, caption)
-      : null;
+  function processCaption(caption, resumesAfterShortGap = false) {
+    const continuesAcrossShortGap =
+      resumesAfterShortGap &&
+      isSameCaptionAfterShortGap(displayedCaption, caption);
+    let lineageResult =
+      !continuesAcrossShortGap && rollUpLineage
+        ? applyRollUpLineage(rollUpLineage, caption)
+        : null;
 
     if (!lineageResult) {
       rollUpLineage = null;
-      lineageResult = startRollUpLineage(displayedCaption, caption);
+      if (!continuesAcrossShortGap) {
+        lineageResult = startRollUpLineage(displayedCaption, caption);
+      }
     }
 
     if (lineageResult) {
@@ -1151,10 +1324,9 @@
       return;
     }
 
-    const sharesCurrentCaptionNode = sharesCaptionNode(
-      displayedCaption,
-      caption
-    );
+    const sharesCurrentCaptionNode =
+      continuesAcrossShortGap ||
+      sharesCaptionNode(displayedCaption, caption);
     const transcriptCorrectionHandled =
       sharesCurrentCaptionNode &&
       replaceTranscriptCaptionRevision(
@@ -1171,21 +1343,33 @@
 
     const startsNewEntry =
       Boolean(displayedCaption.text) &&
-      !sharesCaptionNode(displayedCaption, caption);
-    const addition = captionAddition(displayedCaption, caption);
-    const attachToPrevious = captionAdditionAttachesToPrevious(
-      displayedCaption,
-      caption
-    );
+      !sharesCurrentCaptionNode;
+    const addition = continuesAcrossShortGap
+      ? captionAdditionAfterShortGap(displayedCaption, caption)
+      : captionAddition(displayedCaption, caption);
+    const attachToPrevious = continuesAcrossShortGap
+      ? captionAdditionAfterShortGapAttaches(displayedCaption, caption)
+      : captionAdditionAttachesToPrevious(displayedCaption, caption);
     // displayedCaption is also the committed FIFO watermark.  Do not move it
     // backwards when YouTube temporarily shortens the same visual line, or the
     // restored suffix would be queued and spoken a second time.
-    if (!isTransientSameLineShrink(displayedCaption, caption)) {
+    const shortGapShrink =
+      continuesAcrossShortGap &&
+      displayedCaption.text !== caption.text &&
+      displayedCaption.text.startsWith(caption.text);
+    if (shortGapShrink) {
+      displayedCaption = preserveCaptionWatermarkOnNewNodes(
+        displayedCaption,
+        caption
+      );
+    } else if (!isTransientSameLineShrink(displayedCaption, caption)) {
       displayedCaption = caption;
     }
     if (!transcriptCorrectionHandled) {
       recordTranscriptAddition(addition, attachToPrevious, startsNewEntry);
     }
+    // startsNewEntry does not split speech. It only preserves the number of
+    // visual cues represented by a merged queue item for catch-up pacing.
     enqueueSpeech(addition, attachToPrevious, startsNewEntry);
   }
 
@@ -1197,14 +1381,21 @@
 
     if (!scheduledCaption) return;
     const caption = scheduledCaption;
+    const resumesAfterShortGap = scheduledCaptionResumesAfterShortGap;
     scheduledCaption = null;
+    scheduledCaptionResumesAfterShortGap = false;
     captionMutationPending = false;
-    processCaption(caption);
+    processCaption(caption, resumesAfterShortGap);
+    if (pendingSpeechText && !speechBatchDeadlineTimer) {
+      scheduleSpeechBatchDeadline();
+    }
   }
 
-  function scheduleCaption(caption) {
+  function scheduleCaption(caption, resumesAfterShortGap = false) {
     if (captionTimer) clearTimeout(captionTimer);
     scheduledCaption = caption;
+    scheduledCaptionResumesAfterShortGap =
+      scheduledCaptionResumesAfterShortGap || resumesAfterShortGap;
     captionTimer = setTimeout(flushScheduledCaption, CAPTION_SETTLE_MS);
 
     // A continuously growing live caption can mutate faster than the settle
@@ -1218,6 +1409,9 @@
     const caption = currentCaption();
     const previousObservation = observedCaption;
     observedCaption = caption;
+
+    const resumesAfterShortGap =
+      Boolean(caption.text) && cancelCaptionGapBoundary();
 
     if (
       previousObservation.text &&
@@ -1257,13 +1451,7 @@
     if (!caption.text) {
       // Do not lose a short caption that disappeared before the settle timer.
       flushScheduledCaption();
-      flushSpeechBuffer();
-      // A later identical sentence is a new caption and must be read again.
-      displayedCaption = { text: "", nodes: [], lines: [] };
-      rollUpLineage = null;
-      if (transcriptSession.recording && transcriptSession.entries.length) {
-        transcriptSession.entryBoundaryPending = true;
-      }
+      scheduleCaptionGapBoundary();
       return;
     }
 
@@ -1274,7 +1462,7 @@
 
       if (sameGrowingCaption) {
         // Replace a character-by-character draft with its latest complete form.
-        scheduleCaption(caption);
+        scheduleCaption(caption, resumesAfterShortGap);
         return;
       }
 
@@ -1283,7 +1471,7 @@
       flushScheduledCaption();
     }
 
-    scheduleCaption(caption);
+    scheduleCaption(caption, resumesAfterShortGap);
   }
 
   function observe() {
@@ -1321,7 +1509,7 @@
         : normalizedSpeechRate(previousRate);
 
     // Migrate only the old 1.35x default. Preserve a user's custom rate and
-    // voice; selectedVoice() safely ignores a saved non-Vietnamese voice.
+    // voice, including a non-Vietnamese voice explicitly selected in the popup.
     if (settings.ttsSettingsVersion < TTS_SETTINGS_VERSION) {
       settings.ttsSettingsVersion = TTS_SETTINGS_VERSION;
       chrome.storage.sync.set({
@@ -1337,10 +1525,9 @@
     if (area !== "sync") return;
 
     const wasEnabled = settings.enabled;
-    const voiceSettingChanged = Object.prototype.hasOwnProperty.call(
-      changes,
-      "voiceURI"
-    );
+    const voiceSettingChanged =
+      Object.prototype.hasOwnProperty.call(changes, "voiceURI") ||
+      Object.prototype.hasOwnProperty.call(changes, "allowAnyVoice");
     for (const [key, change] of Object.entries(changes)) {
       if (Object.prototype.hasOwnProperty.call(DEFAULTS, key)) {
         settings[key] = change.newValue;
@@ -1351,6 +1538,7 @@
       if (voiceLoadWaitTimer) clearTimeout(voiceLoadWaitTimer);
       voiceLoadWaitTimer = null;
       voiceLoadWaitFinished = false;
+      voiceLoadWaitDeadline = Date.now() + VOICE_LOAD_WAIT_MS;
     }
 
     if (!settings.enabled) {

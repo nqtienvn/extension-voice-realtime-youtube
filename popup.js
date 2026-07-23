@@ -7,6 +7,7 @@ const DEFAULTS = {
   enabled: true,
   rate: 1,
   voiceURI: "",
+  allowAnyVoice: false,
   ttsSettingsVersion: 0
 };
 const TRANSCRIPT_MESSAGES = Object.freeze({
@@ -25,6 +26,7 @@ const transcriptStatus = document.querySelector("#transcriptStatus");
 const transcriptButton = document.querySelector("#transcriptButton");
 const transcriptDownload = document.querySelector("#transcriptDownload");
 let preferredVoiceURI = "";
+let allowAnyVoiceSelection = false;
 let transcriptConnected = false;
 let transcriptBusy = true;
 let transcriptError = "";
@@ -57,8 +59,10 @@ function saveGeneralSettings() {
 
 function saveVoiceSetting() {
   preferredVoiceURI = voice.value;
+  allowAnyVoiceSelection = Boolean(preferredVoiceURI);
   chrome.storage.sync.set({
     voiceURI: preferredVoiceURI,
+    allowAnyVoice: allowAnyVoiceSelection,
     ttsSettingsVersion: TTS_SETTINGS_VERSION
   });
 }
@@ -80,6 +84,7 @@ function isVietnameseVoice(item) {
 
 function voiceScore(item) {
   return (
+    (isVietnameseVoice(item) ? 8 : 0) +
     (canonicalLanguageTag(item.lang).toLowerCase() ===
     VIETNAMESE_LANG.toLowerCase()
       ? 4
@@ -94,7 +99,6 @@ function populateVoices() {
 
   const voices = speechSynthesis
     .getVoices()
-    .filter(isVietnameseVoice)
     .sort(
       (first, second) =>
         voiceScore(second) - voiceScore(first) ||
@@ -108,12 +112,17 @@ function populateVoices() {
     voice.append(option);
   }
 
-  voice.value = voices.some((item) => item.voiceURI === preferredVoiceURI)
-    ? preferredVoiceURI
-    : "";
+  const preferredVoice = voices.find(
+    (item) => item.voiceURI === preferredVoiceURI
+  );
+  voice.value =
+    preferredVoice &&
+    (allowAnyVoiceSelection || isVietnameseVoice(preferredVoice))
+      ? preferredVoiceURI
+      : "";
   voiceHint.textContent = voices.length
-    ? `Đã tìm thấy ${voices.length} giọng tiếng Việt.`
-      : "Không tìm thấy giọng tiếng Việt; hãy cài giọng Vietnamese (vi-VN) trong hệ điều hành.";
+    ? `Đã tìm thấy ${voices.length} giọng; giọng tiếng Việt được ưu tiên ở đầu.`
+    : "Không tìm thấy giọng đọc nào trong trình duyệt hoặc hệ điều hành.";
 }
 
 function renderTranscriptState() {
@@ -397,6 +406,7 @@ chrome.storage.sync.get(DEFAULTS, (settings) => {
   }
 
   preferredVoiceURI = settings.voiceURI;
+  allowAnyVoiceSelection = Boolean(settings.allowAnyVoice);
   enabled.checked = settings.enabled;
   rate.value = settings.rate;
   showRate();
