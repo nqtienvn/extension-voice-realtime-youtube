@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Caption Voice",
+  "version": "0.1.0",
+  "description": "Đọc ngay phụ đề đang hiển thị trên YouTube bằng giọng nói cục bộ.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://youtube.com/*", "https://*.youtube.com/*"],
+  "action": {
+    "default_title": "YouTube Caption Voice",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://youtube.com/*", "https://*.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YouTube Caption Voice</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <label class="toggle">
+        <input id="enabled" type="checkbox" />
+        <span>Đọc phụ đề</span>
+      </label>
+
+      <label>
+        Tốc độ <output id="rateValue" for="rate"></output>
+        <input id="rate" type="range" min="0.8" max="3" step="0.05" />
+      </label>
+
+      <label>
+        Giọng đọc
+        <select id="voice"><option value="">Giọng mặc định của hệ thống</option></select>
+      </label>
+
+      <label class="toggle">
+        <input id="interruptPrevious" type="checkbox" />
+        <span>Bỏ câu cũ khi có phụ đề mới</span>
+      </label>
+
+      <p>Chỉ đọc phụ đề đang bật trong trình phát YouTube.</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
