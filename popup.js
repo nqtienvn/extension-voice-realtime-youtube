@@ -1,15 +1,13 @@
 const DEFAULTS = {
   enabled: true,
   rate: 1.35,
-  voiceURI: "",
-  interruptPrevious: true
+  voiceURI: ""
 };
 
 const enabled = document.querySelector("#enabled");
 const rate = document.querySelector("#rate");
 const rateValue = document.querySelector("#rateValue");
 const voice = document.querySelector("#voice");
-const interruptPrevious = document.querySelector("#interruptPrevious");
 
 function showRate() {
   rateValue.value = `${Number(rate.value).toFixed(2)}×`;
@@ -19,8 +17,7 @@ function save() {
   chrome.storage.sync.set({
     enabled: enabled.checked,
     rate: Number(rate.value),
-    voiceURI: voice.value,
-    interruptPrevious: interruptPrevious.checked
+    voiceURI: voice.value
   });
 }
 
@@ -38,7 +35,6 @@ function populateVoices(activeVoiceURI) {
 chrome.storage.sync.get(DEFAULTS, (settings) => {
   enabled.checked = settings.enabled;
   rate.value = settings.rate;
-  interruptPrevious.checked = settings.interruptPrevious;
   showRate();
   populateVoices(settings.voiceURI);
 });
@@ -55,4 +51,3 @@ rate.addEventListener("input", () => {
   save();
 });
 voice.addEventListener("change", save);
-interruptPrevious.addEventListener("change", save);

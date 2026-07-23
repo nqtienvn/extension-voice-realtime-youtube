@@ -15,4 +15,6 @@ Extension không dùng API mạng: `MutationObserver` bắt thay đổi phụ đ
 
 Tuy vậy, không extension nào cam kết âm thanh thực sự bắt đầu dưới 100 ms trên mọi máy; Chrome và hệ điều hành quyết định lịch khởi động giọng nói. Để đạt mức thấp nhất, hãy chọn voice có nhãn **local** trong popup (không có “— mạng”).
 
-Khi YouTube nối thêm từ vào cùng một caption, extension chỉ đọc phần mới, không đọc lại từ đầu. Nó chỉ hủy giọng đang đọc khi YouTube chuyển sang caption khác; tắt “Bỏ câu cũ khi có phụ đề mới” nếu muốn đọc hết từng câu.
+Mọi phần chữ mới do YouTube sinh ra đều được lưu vào hàng đợi trong bộ nhớ. Extension chỉ phát mục tiếp theo khi mục hiện tại đã đọc xong (hoặc giọng đọc báo lỗi), nên caption mới không cắt ngang caption cũ.
+
+Khi YouTube nối thêm từ vào cùng một caption, extension chỉ thêm phần mới. Với caption dạng cuộn như `một hai ba` → `hai ba bốn`, phần giao `hai ba` được nhận diện để chỉ xếp `bốn` vào hàng đợi, tránh đọc lặp. Nếu hai caption chỉ có đúng một từ chung ở ranh giới, extension vẫn giữ từ đó để không bỏ nhầm nội dung của một câu mới.
