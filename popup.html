@@ -15,15 +15,21 @@
 
       <label>
         Tốc độ <output id="rateValue" for="rate"></output>
-        <input id="rate" type="range" min="0.8" max="3" step="0.05" />
+        <input id="rate" type="range" min="0.75" max="3" step="0.05" />
       </label>
 
       <label>
         Giọng đọc
-        <select id="voice"><option value="">Giọng mặc định của hệ thống</option></select>
+        <select id="voice">
+          <option value="">Tự động chọn giọng tiếng Việt (vi-VN)</option>
+        </select>
       </label>
+      <p id="voiceHint"></p>
 
-      <p>Phụ đề mới được lưu vào hàng đợi và đọc tuần tự, không cắt câu đang đọc.</p>
+      <p>
+        Phụ đề được đọc tuần tự; khi FIFO tồn đọng, extension tự tăng nhẹ tốc
+        độ để bám sát video.
+      </p>
     </main>
     <script src="popup.js"></script>
   </body>

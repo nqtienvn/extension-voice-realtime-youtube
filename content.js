@@ -1,20 +1,29 @@
 /*
  * Runs in YouTube's tab.  Keeping TTS here avoids a background/service-worker
  * round trip and avoids any network call: this is the shortest path available
- * to a local Chrome/system voice.
+ * to an available Chrome/system voice.
  */
 (() => {
+  const VIETNAMESE_LANG = "vi-VN";
+  const TTS_SETTINGS_VERSION = 1;
+  const LEGACY_DEFAULT_RATE = 1.35;
+  const MIN_SPEECH_RATE = 0.75;
+  const MAX_SPEECH_RATE = 3;
+  const VOICE_LOAD_WAIT_MS = 600;
+  const CATCH_UP_RATE_STEP = 0.1;
+  const MAX_CATCH_UP_MULTIPLIER = 1.3;
   const DEFAULTS = {
     enabled: true,
-    rate: 1.35,
+    rate: 1,
     pitch: 1,
     volume: 1,
-    voiceURI: ""
+    voiceURI: "",
+    ttsSettingsVersion: 0
   };
-  const CAPTION_SETTLE_MS = 80;
-  const CAPTION_MAX_WAIT_MS = 250;
-  const SPEECH_BATCH_SETTLE_MS = 320;
-  const SPEECH_BATCH_MAX_WAIT_MS = 900;
+  const CAPTION_SETTLE_MS = 40;
+  const CAPTION_MAX_WAIT_MS = 180;
+  const SPEECH_BATCH_SETTLE_MS = 260;
+  const SPEECH_BATCH_MAX_WAIT_MS = 550;
 
   let settings = { ...DEFAULTS };
   let displayedCaption = { text: "", nodes: [], lines: [] };
@@ -22,19 +31,82 @@
   let scheduledCaption = null;
   let captionTimer = null;
   let captionDeadlineTimer = null;
+  let captionMutationPending = false;
   const speechQueue = [];
   let activeUtterance = null;
   let speechGeneration = 0;
   let pendingSpeechText = "";
   let pendingSpeechAttachesToPrevious = false;
   let pendingSpeechStartsNewEntry = false;
+  let pendingTailHasQueuedStablePrefix = false;
   let speechBatchTimer = null;
   let speechBatchDeadlineTimer = null;
   let rollUpLineage = null;
   let observer = null;
+  let voiceLoadWaitTimer = null;
+  let voiceLoadWaitFinished = false;
+  const voiceLoadWaitDeadline = Date.now() + VOICE_LOAD_WAIT_MS;
 
   function normalize(text) {
-    return text.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+    return String(text ?? "")
+      .normalize("NFC")
+      .replace(
+        /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/gu,
+        ""
+      )
+      .replace(/\s+/gu, " ")
+      .replace(/\s+([,.;:!?…])/gu, "$1")
+      .trim();
+  }
+
+  const NON_SPEECH_CUES = new Set([
+    "music",
+    "applause",
+    "laughter",
+    "cheering",
+    "inaudible",
+    "unintelligible",
+    "nhạc",
+    "âm nhạc",
+    "tiếng nhạc",
+    "vỗ tay",
+    "tiếng vỗ tay",
+    "cười",
+    "tiếng cười",
+    "cổ vũ",
+    "reo hò",
+    "không nghe rõ"
+  ]);
+
+  function prepareSpeechText(text) {
+    let prepared = normalize(text)
+      .replace(/\[([^\[\]]+)\]/gu, (match, square) => {
+        const cue = normalize(square).toLocaleLowerCase("vi");
+        return NON_SPEECH_CUES.has(cue) ? " " : match;
+      })
+      .replace(/^\(([^()]+)\)$/u, (match, round) => {
+        const cue = normalize(round).toLocaleLowerCase("vi");
+        return NON_SPEECH_CUES.has(cue) ? "" : match;
+      })
+      .replace(/[♪♫♬]+/gu, " ");
+
+    // Expand only numeric-adjacent symbols whose Vietnamese reading is
+    // unambiguous. Keep acronyms, dates, versions, URLs, and generic symbols.
+    prepared = prepared
+      .replace(
+        /(^|[^\p{L}\p{N}_])(\d[\d.,]*)%(?![\p{L}\p{N}_])/gu,
+        "$1$2 phần trăm"
+      )
+      .replace(
+        /(^|[^\p{L}\p{N}_])(\d[\d.,]*)\s*₫(?![\p{L}\p{N}_])/gu,
+        "$1$2 đồng"
+      )
+      .replace(
+        /(^|[^\p{L}\p{N}_])(\d[\d.,]*)\s*°\s*[cC](?![\p{L}\p{N}_])/gu,
+        "$1$2 độ C"
+      );
+
+    return normalize(prepared);
   }
 
   function appendSpeechText(base, addition, attachToPrevious = false) {
@@ -102,31 +174,125 @@
     return sharesCaptionNode(first, second);
   }
 
-  function selectedVoice() {
-    if (!settings.voiceURI) return null;
-    return speechSynthesis.getVoices().find((voice) => voice.voiceURI === settings.voiceURI) || null;
+  function isVietnameseVoice(voice) {
+    return /^vi(?:-|$)/i.test(canonicalLanguageTag(voice.lang));
   }
 
-  function createUtterance(text) {
+  function canonicalLanguageTag(language) {
+    const candidate = String(language || "").trim().replace(/_/g, "-");
+    if (!candidate) return "";
+
+    try {
+      return Intl.getCanonicalLocales(candidate)[0] || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function voiceScore(voice) {
+    const normalizedLang = canonicalLanguageTag(voice.lang).toLowerCase();
+    return (
+      (normalizedLang === VIETNAMESE_LANG.toLowerCase() ? 4 : 0) +
+      (voice.default ? 2 : 0) +
+      (voice.localService ? 1 : 0)
+    );
+  }
+
+  function normalizedSpeechRate(value) {
+    const numericRate = Number(value);
+    if (!Number.isFinite(numericRate)) return DEFAULTS.rate;
+    return Math.min(MAX_SPEECH_RATE, Math.max(MIN_SPEECH_RATE, numericRate));
+  }
+
+  function catchUpSpeechRate(value, backlogDepth) {
+    const baseRate = normalizedSpeechRate(value);
+    const extraEntries = Math.max(0, Number(backlogDepth) - 1);
+    const multiplier = Math.min(
+      MAX_CATCH_UP_MULTIPLIER,
+      1 + extraEntries * CATCH_UP_RATE_STEP
+    );
+    return normalizedSpeechRate(baseRate * multiplier);
+  }
+
+  function configuredVoice() {
+    return speechSynthesis.getVoices().find(
+      (voice) => voice.voiceURI === settings.voiceURI
+    );
+  }
+
+  function requestedVoice() {
+    const voice = configuredVoice();
+    return voice && isVietnameseVoice(voice) ? voice : null;
+  }
+
+  function selectedVoice() {
+    const voices = speechSynthesis.getVoices();
+    const requested = requestedVoice();
+    if (requested) return requested;
+
+    return (
+      voices
+        .filter(isVietnameseVoice)
+        .sort((first, second) => voiceScore(second) - voiceScore(first))[0] ||
+      null
+    );
+  }
+
+  function createUtterance(text, backlogDepth = 1) {
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = Number(settings.rate);
+    utterance.rate = catchUpSpeechRate(settings.rate, backlogDepth);
     utterance.pitch = Number(settings.pitch);
     utterance.volume = Number(settings.volume);
-    utterance.lang = document.documentElement.lang || navigator.language;
+    utterance.lang = VIETNAMESE_LANG;
 
     const voice = selectedVoice();
     if (voice) {
       utterance.voice = voice;
-      utterance.lang = voice.lang;
+      utterance.lang = canonicalLanguageTag(voice.lang) || VIETNAMESE_LANG;
     }
 
     return utterance;
   }
 
+  function shouldWaitForRequestedVoice() {
+    const configured = configuredVoice();
+    if (
+      !settings.voiceURI ||
+      configured ||
+      voiceLoadWaitFinished
+    ) {
+      return false;
+    }
+
+    const remainingWait = voiceLoadWaitDeadline - Date.now();
+    if (remainingWait <= 0) {
+      voiceLoadWaitFinished = true;
+      return false;
+    }
+
+    if (!voiceLoadWaitTimer) {
+      voiceLoadWaitTimer = setTimeout(() => {
+        voiceLoadWaitTimer = null;
+        voiceLoadWaitFinished = true;
+        pumpSpeechQueue();
+      }, remainingWait);
+    }
+    return true;
+  }
+
   function pumpSpeechQueue() {
     if (!settings.enabled || activeUtterance || !speechQueue.length) return;
 
-    const utterance = createUtterance(speechQueue.shift());
+    let speechText = "";
+    while (speechQueue.length && !speechText) {
+      speechText = prepareSpeechText(speechQueue[0]);
+      if (!speechText) speechQueue.shift();
+    }
+    if (!speechText || shouldWaitForRequestedVoice()) return;
+
+    const backlogDepth = speechQueue.length;
+    speechQueue.shift();
+    const utterance = createUtterance(speechText, backlogDepth);
     const generation = speechGeneration;
     activeUtterance = utterance;
 
@@ -137,7 +303,13 @@
       activeUtterance = null;
       // If a fragment is still inside the coalescing window, let its timer merge
       // it into the queued phrase before starting the next utterance.
-      if (!pendingSpeechText) pumpSpeechQueue();
+      if (
+        !pendingSpeechText ||
+        pendingTailHasQueuedStablePrefix ||
+        pendingSpeechStartsNewEntry
+      ) {
+        pumpSpeechQueue();
+      }
     };
 
     utterance.onend = finish;
@@ -150,43 +322,138 @@
     }
   }
 
-  function flushSpeechBuffer() {
-    if (speechBatchTimer) clearTimeout(speechBatchTimer);
-    speechBatchTimer = null;
+  function splitStableSpeechPrefix(text) {
+    if (!text) return { stableText: "", trailingText: "" };
+
+    const lastBoundary = text.lastIndexOf(" ");
+    if (lastBoundary < 0) {
+      return { stableText: "", trailingText: text };
+    }
+
+    return {
+      stableText: normalize(text.slice(0, lastBoundary)),
+      trailingText: normalize(text.slice(lastBoundary + 1))
+    };
+  }
+
+  function flushSpeechBuffer(includeTrailingToken = true) {
+    if (captionMutationPending) {
+      if (includeTrailingToken) {
+        if (speechBatchTimer) clearTimeout(speechBatchTimer);
+        speechBatchTimer = setTimeout(
+          () => flushSpeechBuffer(true),
+          CAPTION_SETTLE_MS
+        );
+      } else {
+        if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
+        speechBatchDeadlineTimer = setTimeout(
+          () => flushSpeechBuffer(false),
+          CAPTION_SETTLE_MS
+        );
+      }
+      return;
+    }
+
+    // A hard prefix deadline must not restart the quiet timer. If the last
+    // caption mutation is already close to becoming stable, keep that original
+    // timer so it can flush the final token on time.
+    if (includeTrailingToken && speechBatchTimer) {
+      clearTimeout(speechBatchTimer);
+      speechBatchTimer = null;
+    }
     if (speechBatchDeadlineTimer) clearTimeout(speechBatchDeadlineTimer);
     speechBatchDeadlineTimer = null;
 
     if (!pendingSpeechText) return;
 
-    if (speechQueue.length && !pendingSpeechStartsNewEntry) {
+    const split = includeTrailingToken
+      ? { stableText: pendingSpeechText, trailingText: "" }
+      : splitStableSpeechPrefix(pendingSpeechText);
+    const textToQueue = split.stableText;
+    const attachToPrevious = pendingSpeechAttachesToPrevious;
+    const startsNewEntry = pendingSpeechStartsNewEntry;
+    const retainedTrailingText = Boolean(split.trailingText);
+
+    pendingSpeechText = split.trailingText;
+
+    if (!textToQueue) {
+      // The deadline found only an unfinished token. Keep its relationship to
+      // the preceding queued text so later character deltas still join without
+      // an artificial space.
+      pendingSpeechAttachesToPrevious = attachToPrevious;
+      pendingSpeechStartsNewEntry = startsNewEntry;
+      pendingTailHasQueuedStablePrefix =
+        pendingTailHasQueuedStablePrefix ||
+        (speechQueue.length > 0 && !attachToPrevious);
+      if (pendingTailHasQueuedStablePrefix) pumpSpeechQueue();
+      if (!speechBatchTimer) {
+        speechBatchTimer = setTimeout(
+          () => flushSpeechBuffer(true),
+          SPEECH_BATCH_SETTLE_MS
+        );
+      }
+      scheduleSpeechBatchDeadline();
+      return;
+    }
+
+    pendingSpeechAttachesToPrevious = false;
+    pendingSpeechStartsNewEntry = false;
+    pendingTailHasQueuedStablePrefix = retainedTrailingText;
+
+    if (speechQueue.length && !startsNewEntry) {
       const lastIndex = speechQueue.length - 1;
       speechQueue[lastIndex] = appendSpeechText(
         speechQueue[lastIndex],
-        pendingSpeechText,
-        pendingSpeechAttachesToPrevious
+        textToQueue,
+        attachToPrevious
       );
     } else {
-      speechQueue.push(pendingSpeechText);
+      speechQueue.push(textToQueue);
     }
 
-    pendingSpeechText = "";
-    pendingSpeechAttachesToPrevious = false;
-    pendingSpeechStartsNewEntry = false;
     pumpSpeechQueue();
+    if (pendingSpeechText) {
+      if (!speechBatchTimer) {
+        speechBatchTimer = setTimeout(
+          () => flushSpeechBuffer(true),
+          SPEECH_BATCH_SETTLE_MS
+        );
+      }
+      scheduleSpeechBatchDeadline();
+    } else if (speechBatchTimer) {
+      clearTimeout(speechBatchTimer);
+      speechBatchTimer = null;
+    }
+  }
+
+  function scheduleSpeechBatchDeadline() {
+    // Continuous captions still need bounded latency, but the hard deadline
+    // flushes only complete-word prefixes. A trailing draft token keeps the
+    // ordinary settle window instead of being forced out mid-update.
+    if (!speechBatchDeadlineTimer) {
+      speechBatchDeadlineTimer = setTimeout(
+        () => flushSpeechBuffer(false),
+        SPEECH_BATCH_MAX_WAIT_MS
+      );
+    }
   }
 
   function scheduleSpeechBufferFlush() {
     if (speechBatchTimer) clearTimeout(speechBatchTimer);
-    speechBatchTimer = setTimeout(flushSpeechBuffer, SPEECH_BATCH_SETTLE_MS);
+    speechBatchTimer = setTimeout(
+      () => flushSpeechBuffer(true),
+      SPEECH_BATCH_SETTLE_MS
+    );
+    scheduleSpeechBatchDeadline();
+  }
 
-    // Continuous captions still need bounded latency, but the larger deadline
-    // lets several nearby words become one intelligible utterance.
-    if (!speechBatchDeadlineTimer) {
-      speechBatchDeadlineTimer = setTimeout(
-        flushSpeechBuffer,
-        SPEECH_BATCH_MAX_WAIT_MS
-      );
-    }
+  function postponeSpeechSettleForCaptionMutation() {
+    if (!pendingSpeechText || !speechBatchTimer) return;
+    clearTimeout(speechBatchTimer);
+    speechBatchTimer = setTimeout(
+      () => flushSpeechBuffer(true),
+      CAPTION_SETTLE_MS + SPEECH_BATCH_SETTLE_MS
+    );
   }
 
   function enqueueSpeech(
@@ -203,6 +470,7 @@
       pendingSpeechText = addition;
       pendingSpeechAttachesToPrevious = attachToPrevious;
       pendingSpeechStartsNewEntry = startsNewEntry;
+      pendingTailHasQueuedStablePrefix = false;
     } else {
       pendingSpeechText = appendSpeechText(
         pendingSpeechText,
@@ -222,9 +490,14 @@
     pendingSpeechText = "";
     pendingSpeechAttachesToPrevious = false;
     pendingSpeechStartsNewEntry = false;
+    pendingTailHasQueuedStablePrefix = false;
+    captionMutationPending = false;
     speechQueue.length = 0;
     speechGeneration += 1;
     activeUtterance = null;
+    if (voiceLoadWaitTimer) clearTimeout(voiceLoadWaitTimer);
+    voiceLoadWaitTimer = null;
+    voiceLoadWaitFinished = false;
     speechSynthesis.cancel();
   }
 
@@ -419,6 +692,94 @@
     });
   }
 
+  function foldVietnameseWord(word) {
+    return word
+      .normalize("NFD")
+      .replace(/\p{M}+/gu, "")
+      .replace(/[đĐ]/gu, "d")
+      .toLocaleLowerCase("vi");
+  }
+
+  function areLikelyWordVariants(previousWord, currentWord) {
+    const previousLetters = Array.from(foldVietnameseWord(previousWord));
+    const currentLetters = Array.from(foldVietnameseWord(currentWord));
+    if (!previousLetters.length || !currentLetters.length) return false;
+    if (previousLetters.join("") === currentLetters.join("")) return true;
+
+    const requiredPrefix = Math.min(
+      2,
+      previousLetters.length,
+      currentLetters.length
+    );
+    let sharedPrefix = 0;
+    while (
+      sharedPrefix < previousLetters.length &&
+      sharedPrefix < currentLetters.length &&
+      previousLetters[sharedPrefix] === currentLetters[sharedPrefix]
+    ) {
+      sharedPrefix += 1;
+    }
+    return sharedPrefix >= requiredPrefix;
+  }
+
+  function isLikelyTrailingWordCorrection(previousText, currentText) {
+    if (
+      previousText !== currentText &&
+      foldVietnameseWord(previousText) === foldVietnameseWord(currentText)
+    ) {
+      return true;
+    }
+
+    const previousWords = previousText.split(" ");
+    const currentWords = currentText.split(" ");
+    if (
+      previousWords.length !== currentWords.length ||
+      previousWords.length === 0
+    ) {
+      return false;
+    }
+
+    const lastIndex = previousWords.length - 1;
+    for (let index = 0; index < lastIndex; index += 1) {
+      if (previousWords[index] !== currentWords[index]) return false;
+    }
+    if (previousWords[lastIndex] === currentWords[lastIndex]) return false;
+
+    // Require the changed word itself to be a close spelling/diacritic variant.
+    // This distinguishes "học" -> "họp" from a real update such as
+    // "tôi chọn A" -> "tôi chọn B".
+    return areLikelyWordVariants(
+      previousWords[lastIndex],
+      currentWords[lastIndex]
+    );
+  }
+
+  function replacePendingDraftCorrection(previousText, currentText) {
+    if (
+      !pendingSpeechText ||
+      !isLikelyTrailingWordCorrection(previousText, currentText) ||
+      !previousText.endsWith(pendingSpeechText)
+    ) {
+      return false;
+    }
+
+    const stablePrefix = previousText.slice(
+      0,
+      previousText.length - pendingSpeechText.length
+    );
+    if (!currentText.startsWith(stablePrefix)) return false;
+
+    const replacement = normalize(currentText.slice(stablePrefix.length));
+    if (!replacement) return false;
+
+    pendingSpeechText = replacement;
+    if (stablePrefix) {
+      pendingSpeechAttachesToPrevious = !/\s$/u.test(stablePrefix);
+    }
+    scheduleSpeechBufferFlush();
+    return true;
+  }
+
   function processCaption(caption) {
     let lineageResult = rollUpLineage
       ? applyRollUpLineage(rollUpLineage, caption)
@@ -436,6 +797,14 @@
         lineageResult.addition,
         lineageResult.attachToPrevious
       );
+      return;
+    }
+
+    if (
+      sharesCaptionNode(displayedCaption, caption) &&
+      replacePendingDraftCorrection(displayedCaption.text, caption.text)
+    ) {
+      displayedCaption = caption;
       return;
     }
 
@@ -465,6 +834,7 @@
     if (!scheduledCaption) return;
     const caption = scheduledCaption;
     scheduledCaption = null;
+    captionMutationPending = false;
     processCaption(caption);
   }
 
@@ -484,6 +854,19 @@
     const caption = currentCaption();
     const previousObservation = observedCaption;
     observedCaption = caption;
+
+    if (
+      previousObservation.text &&
+      caption.text &&
+      previousObservation.text !== caption.text &&
+      sharesCaptionNode(previousObservation, caption)
+    ) {
+      // MutationObserver sees the new draft before the caption debounce commits
+      // it. Postpone the speech tail immediately so the old prefix cannot start
+      // in that gap and split one Vietnamese word into two utterances.
+      captionMutationPending = true;
+      postponeSpeechSettleForCaptionMutation();
+    }
 
     // The observer watches the whole page, so most mutations do not change the
     // same caption.  DOM identity distinguishes a repeated new cue from a
@@ -562,6 +945,24 @@
 
   chrome.storage.sync.get(DEFAULTS, (saved) => {
     settings = { ...DEFAULTS, ...saved };
+
+    const previousRate = Number(settings.rate);
+    settings.rate =
+      settings.ttsSettingsVersion < TTS_SETTINGS_VERSION &&
+      previousRate === LEGACY_DEFAULT_RATE
+        ? DEFAULTS.rate
+        : normalizedSpeechRate(previousRate);
+
+    // Migrate only the old 1.35x default. Preserve a user's custom rate and
+    // voice; selectedVoice() safely ignores a saved non-Vietnamese voice.
+    if (settings.ttsSettingsVersion < TTS_SETTINGS_VERSION) {
+      settings.ttsSettingsVersion = TTS_SETTINGS_VERSION;
+      chrome.storage.sync.set({
+        rate: settings.rate,
+        ttsSettingsVersion: settings.ttsSettingsVersion
+      });
+    }
+
     startWhenReady();
   });
 
@@ -569,10 +970,20 @@
     if (area !== "sync") return;
 
     const wasEnabled = settings.enabled;
+    const voiceSettingChanged = Object.prototype.hasOwnProperty.call(
+      changes,
+      "voiceURI"
+    );
     for (const [key, change] of Object.entries(changes)) {
       if (Object.prototype.hasOwnProperty.call(DEFAULTS, key)) {
         settings[key] = change.newValue;
       }
+    }
+
+    if (voiceSettingChanged) {
+      if (voiceLoadWaitTimer) clearTimeout(voiceLoadWaitTimer);
+      voiceLoadWaitTimer = null;
+      voiceLoadWaitFinished = false;
     }
 
     if (!settings.enabled) {
@@ -584,6 +995,21 @@
       scheduledCaption = null;
       rollUpLineage = null;
       inspectCaption();
+    } else if (voiceSettingChanged) {
+      pumpSpeechQueue();
     }
   });
+
+  if (typeof speechSynthesis.addEventListener === "function") {
+    speechSynthesis.addEventListener("voiceschanged", () => {
+      if (!voiceLoadWaitTimer || !configuredVoice()) return;
+      clearTimeout(voiceLoadWaitTimer);
+      voiceLoadWaitTimer = null;
+      voiceLoadWaitFinished = true;
+      pumpSpeechQueue();
+    });
+  }
+  // Start loading the browser/system voice list at document_start so the first
+  // visible caption normally pays no additional voice-discovery delay.
+  speechSynthesis.getVoices();
 })();

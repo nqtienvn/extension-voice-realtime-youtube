@@ -6,12 +6,17 @@ const vm = require("node:vm");
 
 const CONTENT_SCRIPT = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
 
-function createHarness(savedSettings = {}) {
+function createHarness(savedSettings = {}, availableVoices = []) {
   let captionSegments = [];
   let storageListener = null;
   let cancelCount = 0;
+  let currentVoices = [...availableVoices];
   const observers = [];
   const spoken = [];
+  const spokenAt = [];
+  const storageWrites = [];
+  const voiceListeners = [];
+  const persistedSettings = { ...savedSettings };
 
   class FakeMutationObserver {
     constructor(callback) {
@@ -37,10 +42,14 @@ function createHarness(savedSettings = {}) {
       cancelCount += 1;
     },
     getVoices() {
-      return [];
+      return currentVoices;
     },
     speak(utterance) {
       spoken.push(utterance);
+      spokenAt.push(Date.now());
+    },
+    addEventListener(event, listener) {
+      if (event === "voiceschanged") voiceListeners.push(listener);
     }
   };
 
@@ -56,7 +65,11 @@ function createHarness(savedSettings = {}) {
     storage: {
       sync: {
         get(defaults, callback) {
-          callback({ ...defaults, ...savedSettings });
+          callback({ ...defaults, ...persistedSettings });
+        },
+        set(values) {
+          storageWrites.push({ ...values });
+          Object.assign(persistedSettings, values);
         }
       },
       onChanged: {
@@ -102,10 +115,13 @@ function createHarness(savedSettings = {}) {
       return cancelCount;
     },
     spoken,
+    spokenAt,
+    storageWrites,
     changeSettings(changes) {
       const storageChanges = Object.fromEntries(
         Object.entries(changes).map(([key, value]) => [key, { newValue: value }])
       );
+      Object.assign(persistedSettings, changes);
       storageListener(storageChanges, "sync");
     },
     endSpeech(index) {
@@ -113,6 +129,12 @@ function createHarness(savedSettings = {}) {
     },
     failSpeech(index) {
       spoken[index].onerror();
+    },
+    setVoices(voices) {
+      currentVoices = [...voices];
+    },
+    emitVoicesChanged() {
+      for (const listener of voiceListeners) listener();
     },
     mutate() {
       for (const observer of observers) observer.callback([], observer);
@@ -127,7 +149,7 @@ function createHarness(savedSettings = {}) {
 }
 
 function waitForCaptionSettle() {
-  // Includes the 80 ms DOM settle and the 320 ms speech coalescing window.
+  // Includes the 40 ms DOM settle, 260 ms speech coalescing, and timer margin.
   return new Promise((resolve) => setTimeout(resolve, 430));
 }
 
@@ -157,7 +179,7 @@ test("caption mới chờ câu đang đọc xong, kể cả cấu hình cũ từ
   assert.equal(harness.spoken[1].text, "Câu thứ hai");
 });
 
-test("không mất caption ngắn khi nó biến mất trước cửa sổ ổn định 80 ms", async () => {
+test("không mất caption ngắn khi nó biến mất trước cửa sổ ổn định 40 ms", async () => {
   const harness = createHarness();
 
   harness.setCaption("A");
@@ -176,7 +198,7 @@ test("không mất caption ngắn khi nó biến mất trước cửa sổ ổn 
   assert.equal(harness.spoken[1].text, "B");
 });
 
-test("hai caption khác nhau xuất hiện trong 80 ms vẫn được giữ đúng thứ tự", async () => {
+test("hai caption khác nhau xuất hiện trong 40 ms vẫn được giữ đúng thứ tự", async () => {
   const harness = createHarness();
 
   harness.setCaption("caption A");
@@ -522,6 +544,88 @@ test("các bản nháp từng ký tự được gom thành chữ hoàn chỉnh v
   assert.equal(harness.spoken[1].text, "again");
 });
 
+test("ASR sửa từ cuối trong cửa sổ đệm thì thay bản nháp thay vì đọc cả hai", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("tôi đi học");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  harness.setCaption("tôi đi họp");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "tôi đi họp");
+});
+
+test("ASR thêm dấu tiếng Việt vào một từ thì chỉ đọc bản đã sửa", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("ban");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  harness.setCaption("bạn");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "bạn");
+});
+
+test("mutation sát quiet deadline không tách một từ thành hai utterance", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("ngh");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  harness.setCaption("nghiêng");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "nghiêng");
+});
+
+test("mutation đang chờ commit chặn hard deadline phát prefix cũ", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("toi n");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  harness.setCaption("toi ng");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  harness.setCaption("toi ngh");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 170));
+  harness.setCaption("tôi ngh");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "tôi");
+  harness.endSpeech(0);
+  assert.equal(harness.spoken[1].text, "ngh");
+  assert.equal(
+    harness.spoken.some((utterance) => utterance.text === "toi"),
+    false
+  );
+});
+
+test("hai cụm khác nghĩa chỉ giống phần đầu không bị coi là sửa chính tả", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("tôi chọn A");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  harness.setCaption("tôi chọn B");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "tôi chọn A tôi chọn B");
+});
+
 test("lỗi giọng đọc vẫn giải phóng hàng đợi cho mục kế tiếp", async () => {
   const harness = createHarness();
 
@@ -552,4 +656,498 @@ test("tắt extension xóa hàng đợi và callback cũ không thể phát ti�
 
   harness.endSpeech(0);
   assert.equal(harness.spoken.length, 1);
+});
+
+test("chuẩn hóa Unicode NFC trước khi so sánh và đọc tiếng Việt", async () => {
+  const harness = createHarness();
+  const decomposed = "Tiếng Việt".normalize("NFD");
+
+  harness.setCaption(decomposed);
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken[0].text, "Tiếng Việt");
+
+  // Cùng nội dung nhưng đổi từ NFD sang NFC không phải là một caption mới.
+  harness.setCaption("Tiếng Việt");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 1);
+});
+
+test("loại ký tự định dạng vô hình nhưng giữ nguyên nội dung tiếng Việt", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("Ti\u200Bếng Vi\u00ADệt\u2060 Nam");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken[0].text, "Tiếng Việt Nam");
+});
+
+test("chuẩn hóa khoảng trắng trước dấu câu ngay trước khi phát âm", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("Xin chào ,  Việt Nam !");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken[0].text, "Xin chào, Việt Nam!");
+});
+
+test("thay đổi khoảng trắng trước dấu câu không làm đọc lặp", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("Xin chào ,");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.setCaption("Xin chào,");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.endSpeech(0);
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "Xin chào,");
+});
+
+test("bỏ cue phi lời nói nhưng không chặn caption kế tiếp", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("[Music]");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.replaceCaption("Xin chào");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "Xin chào");
+});
+
+test("bỏ cue và nốt nhạc đã biết nhưng giữ nhãn người nói", async () => {
+  const cueHarness = createHarness();
+
+  cueHarness.setCaption("[ÂM NHẠC] ♪ Tôi yêu Việt Nam ♪ [Applause]");
+  cueHarness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(cueHarness.spoken[0].text, "Tôi yêu Việt Nam");
+
+  const labelHarness = createHarness();
+  labelHarness.setCaption("[Người dẫn] Xin chào [A]");
+  labelHarness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(labelHarness.spoken[0].text, "[Người dẫn] Xin chào [A]");
+
+  const lessonHarness = createHarness();
+  const lesson = "Music (âm nhạc) là một danh từ";
+  lessonHarness.setCaption(lesson);
+  lessonHarness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(lessonHarness.spoken[0].text, lesson);
+});
+
+test("đọc rõ phần trăm, đồng và độ C mà không đổi ký hiệu mơ hồ", async () => {
+  const symbolHarness = createHarness();
+
+  symbolHarness.setCaption("Pin 12,5%, giá 100.000₫, nhiệt độ 30°C.");
+  symbolHarness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(
+    symbolHarness.spoken[0].text,
+    "Pin 12,5 phần trăm, giá 100.000 đồng, nhiệt độ 30 độ C."
+  );
+
+  const ambiguousHarness = createHarness();
+  const ambiguous =
+    "AI/API 2.10.3, 03/04/2026, +84, x % 2, 10 % 3, được 10đ, lớp 10Đ, H&M";
+  ambiguousHarness.setCaption(ambiguous);
+  ambiguousHarness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(ambiguousHarness.spoken[0].text, ambiguous);
+});
+
+test("chọn đúng giọng Việt và chuẩn hóa lang vi_VN thành BCP-47", async () => {
+  const englishVoice = {
+    name: "English",
+    lang: "en-US",
+    voiceURI: "voice-en",
+    default: true,
+    localService: true
+  };
+  const vietnameseVoice = {
+    name: "Vietnamese",
+    lang: "vi_VN",
+    voiceURI: "voice-vi",
+    default: false,
+    localService: false
+  };
+  const harness = createHarness(
+    {
+      rate: 0.9,
+      voiceURI: vietnameseVoice.voiceURI,
+      ttsSettingsVersion: 1
+    },
+    [englishVoice, vietnameseVoice]
+  );
+
+  harness.setCaption("Xin chào");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken[0].voice.voiceURI, "voice-vi");
+  assert.equal(harness.spoken[0].lang, "vi-VN");
+  assert.equal(harness.spoken[0].rate, 0.9);
+});
+
+test("bỏ qua voice tiếng Anh cũ mà không trì hoãn giọng Việt tự động", async () => {
+  const englishVoice = {
+    name: "English",
+    lang: "en-US",
+    voiceURI: "voice-en",
+    default: true,
+    localService: true
+  };
+  const vietnameseVoice = {
+    name: "Vietnamese",
+    lang: "vi-VN",
+    voiceURI: "voice-vi",
+    default: false,
+    localService: false
+  };
+  const harness = createHarness(
+    {
+      voiceURI: englishVoice.voiceURI,
+      ttsSettingsVersion: 1
+    },
+    [englishVoice, vietnameseVoice]
+  );
+
+  harness.setCaption("Xin chào");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].voice.voiceURI, vietnameseVoice.voiceURI);
+  assert.equal(harness.spoken[0].lang, "vi-VN");
+});
+
+test("chờ danh sách voice tải xong trước câu đầu khi đã chọn voice cụ thể", async () => {
+  const englishVoice = {
+    name: "English",
+    lang: "en-US",
+    voiceURI: "voice-en",
+    default: true,
+    localService: true
+  };
+  const vietnameseVoice = {
+    name: "Vietnamese",
+    lang: "vi-VN",
+    voiceURI: "voice-vi",
+    default: true,
+    localService: true
+  };
+  const harness = createHarness({
+    voiceURI: vietnameseVoice.voiceURI,
+    ttsSettingsVersion: 1
+  }, [englishVoice]);
+
+  harness.setCaption("Câu đầu tiên");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.emitVoicesChanged();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.setVoices([englishVoice, vietnameseVoice]);
+  harness.emitVoicesChanged();
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].voice.voiceURI, "voice-vi");
+});
+
+test("đổi voice trong lúc đang chờ sẽ phát ngay bằng voice mới đã sẵn sàng", async () => {
+  const readyVoice = {
+    name: "Vietnamese ready",
+    lang: "vi-VN",
+    voiceURI: "voice-ready",
+    default: true,
+    localService: true
+  };
+  const harness = createHarness({
+    voiceURI: "voice-missing",
+    ttsSettingsVersion: 1
+  });
+
+  harness.setCaption("Xin chào");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 0);
+
+  harness.setVoices([readyVoice]);
+  harness.changeSettings({ voiceURI: readyVoice.voiceURI });
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].voice.voiceURI, readyVoice.voiceURI);
+});
+
+test("migration chỉ đổi tốc độ mặc định cũ và giữ cấu hình tùy chỉnh", () => {
+  const custom = createHarness({
+    rate: 2,
+    voiceURI: "voice-vi",
+    ttsSettingsVersion: 0
+  });
+  assert.deepEqual(custom.storageWrites[0], {
+    rate: 2,
+    ttsSettingsVersion: 1
+  });
+
+  const legacy = createHarness({
+    rate: 1.35,
+    voiceURI: "voice-vi",
+    ttsSettingsVersion: 0
+  });
+  assert.deepEqual(legacy.storageWrites[0], {
+    rate: 1,
+    ttsSettingsVersion: 1
+  });
+});
+
+test("deadline chỉ phát các từ hoàn chỉnh và giữ hậu tố đang được dựng", async () => {
+  const harness = createHarness();
+  const drafts = [
+    "xin n",
+    "xin ng",
+    "xin ngh",
+    "xin nghi",
+    "xin nghiê",
+    "xin nghiêng"
+  ];
+
+  harness.setCaption(drafts[0]);
+  harness.mutate();
+  for (const draft of drafts.slice(1)) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    harness.setCaption(draft);
+    harness.mutate();
+  }
+  await waitForCaptionSettle();
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "xin");
+  harness.endSpeech(0);
+  assert.equal(harness.spoken[1].text, "nghiêng");
+});
+
+test("hard deadline không khởi động lại quiet timer sắp hoàn tất", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("n");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  harness.setCaption("ng");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  harness.setCaption("nghi");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 430));
+
+  assert.equal(harness.spoken.length, 1);
+  assert.equal(harness.spoken[0].text, "nghi");
+});
+
+test("audio vừa rảnh không bỏ qua cửa sổ sửa bản nháp ASR", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("tôi n");
+  harness.mutate();
+  await waitForCaptionProcessing();
+
+  harness.endSpeech(0);
+  assert.equal(harness.spoken.length, 1);
+
+  harness.setCaption("tôi nay");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "tôi nay");
+});
+
+test("deadline giữ quan hệ nối từ khi bản nháp đang chờ sau câu khác", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("trước");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.replaceCaption("n");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  for (const draft of ["ng", "ngh", "nghi", "nghiê", "nghiên", "nghiêng"]) {
+    harness.setCaption(draft);
+    harness.mutate();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await waitForCaptionSettle();
+
+  harness.endSpeech(0);
+  assert.equal(harness.spoken[1].text, "nghiêng");
+});
+
+test("đuôi từ đang đổi không chặn tiền tố ổn định đã đến hạn", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.replaceCaption("xin a");
+  harness.mutate();
+  for (const draft of [
+    "xin ab",
+    "xin abc",
+    "xin abcd",
+    "xin abcde",
+    "xin abcdef"
+  ]) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    harness.setCaption(draft);
+    harness.mutate();
+  }
+  await waitForCaptionProcessing();
+
+  harness.endSpeech(0);
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "xin");
+});
+
+test("caption mới đang gom không chặn caption cũ đã nằm trong FIFO", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("B");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.replaceCaption("n");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  harness.endSpeech(0);
+
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "B");
+});
+
+test("hard deadline phát mục FIFO cũ dù hậu tố cùng caption còn đang đổi", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("xin");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.setCaption("xin n");
+  harness.mutate();
+  await waitForCaptionProcessing();
+  harness.endSpeech(0);
+  assert.equal(harness.spoken.length, 1);
+
+  for (const draft of [
+    "xin ng",
+    "xin ngh",
+    "xin nghi",
+    "xin nghiê",
+    "xin nghiên"
+  ]) {
+    harness.setCaption(draft);
+    harness.mutate();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "xin");
+});
+
+test("hard deadline không phát tiền tố đang chờ nối thành cùng một từ", async () => {
+  const harness = createHarness();
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("n");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  for (const draft of ["ng", "ngh", "nghi", "nghiê", "nghiên"]) {
+    harness.setCaption(draft);
+    harness.mutate();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  harness.endSpeech(0);
+  assert.equal(harness.spoken.length, 1);
+
+  harness.setCaption("nghiêng");
+  harness.mutate();
+  await waitForCaptionSettle();
+  assert.equal(harness.spoken.length, 2);
+  assert.equal(harness.spoken[1].text, "nghiêng");
+});
+
+test("caption ổn định bắt đầu TTS trong khoảng dưới 380 ms", async () => {
+  const harness = createHarness();
+  const startedAt = Date.now();
+
+  harness.setCaption("Phản hồi nhanh");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 380));
+
+  assert.equal(harness.spoken.length, 1);
+  assert.ok(
+    harness.spokenAt[0] - startedAt < 380,
+    `TTS bắt đầu sau ${harness.spokenAt[0] - startedAt} ms`
+  );
+});
+
+test("hết cửa sổ tải voice từ document_start thì không cộng thêm 600 ms", async () => {
+  const harness = createHarness({
+    voiceURI: "voice-không-còn-tồn-tại",
+    ttsSettingsVersion: 1
+  });
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  const startedAt = Date.now();
+
+  harness.setCaption("Không chờ voice cũ");
+  harness.mutate();
+  await new Promise((resolve) => setTimeout(resolve, 380));
+
+  assert.equal(harness.spoken.length, 1);
+  assert.ok(harness.spokenAt[0] - startedAt < 380);
+  assert.equal(harness.spoken[0].lang, "vi-VN");
+});
+
+test("tự tăng nhẹ tốc độ khi FIFO có nhiều caption đang chờ", async () => {
+  const harness = createHarness({ rate: 1, ttsSettingsVersion: 1 });
+
+  harness.setCaption("A");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("B");
+  harness.mutate();
+  await waitForCaptionSettle();
+  harness.replaceCaption("C");
+  harness.mutate();
+  await waitForCaptionSettle();
+
+  harness.endSpeech(0);
+  assert.equal(harness.spoken[1].text, "B");
+  assert.equal(harness.spoken[1].rate, 1.1);
 });

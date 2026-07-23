@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YouTube Caption Voice",
-  "version": "0.2.2",
-  "description": "Đọc ngay phụ đề đang hiển thị trên YouTube bằng giọng nói cục bộ.",
+  "version": "0.2.4",
+  "description": "Đọc ngay phụ đề YouTube bằng giọng tiếng Việt của trình duyệt hoặc hệ thống.",
   "permissions": ["storage"],
   "host_permissions": ["https://youtube.com/*", "https://*.youtube.com/*"],
   "action": {

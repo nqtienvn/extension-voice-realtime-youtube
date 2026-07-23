@@ -2,6 +2,29 @@
 
 Chrome Extension Manifest V3 đọc chính xác dòng phụ đề đang hiển thị trong YouTube.
 
+## Giọng tiếng Việt
+
+Extension luôn đặt ngôn ngữ đọc là `vi-VN`, chỉ tự động chọn các voice có mã
+`vi`/`vi-VN`, và giữ nguyên voice tiếng Việt do người dùng chọn. Tốc độ mặc định
+là `1.00×`; cấu hình tùy chỉnh cũ vẫn được giữ, riêng mặc định cũ `1.35×` được
+đưa về `1.00×` một lần để lời đọc rõ hơn.
+
+Trước khi phát âm, extension chuẩn hóa dấu tiếng Việt về Unicode NFC, loại ký tự
+ẩn, sửa khoảng trắng trước dấu câu, bỏ các cue phi lời nói phổ biến như
+`[Âm nhạc]`, và đọc rõ các dạng số liền kề `%`, `₫`, `°C`. Các từ viết tắt,
+ngày tháng, phiên bản, URL và ký hiệu có nhiều cách hiểu được giữ nguyên để
+không tự ý đổi nghĩa caption.
+
+Khi caption trực tiếp còn đang dựng từng ký tự, deadline chỉ đẩy các từ đã hoàn
+chỉnh vào FIFO và giữ lại từ cuối đang thay đổi. Nếu ASR sửa từ cuối khi cụm vẫn
+ở trong bộ đệm, bản sửa sẽ thay bản nháp thay vì bị đọc nối thành hai phiên bản.
+
+Từ phiên bản `0.2.4`, cửa sổ theo dõi DOM giảm từ `80` xuống `40 ms`, thời gian
+gom cụm ổn định giảm từ `320` xuống `260 ms`, và deadline tiền tố an toàn giảm
+từ `900` xuống `550 ms`. Danh sách voice được tải trước từ `document_start`;
+khi FIFO có nhiều caption chờ, tốc độ đọc được tăng thích ứng tối đa `30%` để
+giảm tụt hậu mà không bỏ nội dung.
+
 ## Cài thử
 
 1. Mở `chrome://extensions`.
